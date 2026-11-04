@@ -43,8 +43,8 @@ resource "azurerm_network_security_group" "hub" {
   tags                = local.all_tags
 
   security_rule {
-    name     = "Allow-Https-Callbacks-And-Console"
-    priority = 100
+    name      = "Allow-Https-Callbacks-And-Console"
+    priority  = 100
     direction = "Inbound"
     access    = "Allow"
     protocol  = "Tcp"

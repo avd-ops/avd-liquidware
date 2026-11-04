@@ -23,6 +23,15 @@ metadata description = 'Stratusphere UX appliances (Hub, Database, Collectors) i
 @maxLength(8)
 param namePrefix string
 
+@description('Optional environment segment (dev, test, prod) so the resource group matches rg-<prefix>-<env>-* for deadline teardown.')
+@allowed([
+  ''
+  'dev'
+  'test'
+  'prod'
+])
+param environment string = ''
+
 @description('Azure region for all resources.')
 param location string = deployment().location
 
@@ -98,6 +107,12 @@ param collectorPrivateIps array = [
   '10.60.0.13'
 ]
 
+@description('Daily auto-shutdown time in HHmm (24-hour) for every appliance VM, or empty to disable.')
+param autoShutdownTime string = '2000'
+
+@description('Windows time zone ID for the daily auto-shutdown schedule.')
+param autoShutdownTimeZone string = 'Central Standard Time'
+
 // ---------- Appliance credential ----------
 @description('Local administrator name Azure sets on every appliance.')
 param adminUsername string = 'ssadmin-azure'
@@ -141,7 +156,7 @@ param keyVaultReaderPrincipalType string = 'User'
 
 // ---------- Naming ----------
 var suffix = substring(uniqueString(subscription().subscriptionId, namePrefix, location), 0, 5)
-var rgName = 'rg-${namePrefix}-stratusphere'
+var rgName = empty(environment) ? 'rg-${namePrefix}-stratusphere' : 'rg-${namePrefix}-${environment}-stratusphere'
 var allTags = union(
   {
     workload: 'stratusphere-assessment'
@@ -207,6 +222,8 @@ module hub 'modules/appliance.bicep' = if (deployHub) {
     imageVersion: imageVersion
     adminUsername: adminUsername
     adminPassword: adminPassword
+    autoShutdownTime: autoShutdownTime
+    autoShutdownTimeZone: autoShutdownTimeZone
   }
 }
 
@@ -228,6 +245,8 @@ module database 'modules/appliance.bicep' = if (deployDatabase) {
     imageVersion: imageVersion
     adminUsername: adminUsername
     adminPassword: adminPassword
+    autoShutdownTime: autoShutdownTime
+    autoShutdownTimeZone: autoShutdownTimeZone
   }
 }
 
@@ -250,6 +269,8 @@ module collectors 'modules/appliance.bicep' = [
       imageVersion: imageVersion
       adminUsername: adminUsername
       adminPassword: adminPassword
+      autoShutdownTime: autoShutdownTime
+      autoShutdownTimeZone: autoShutdownTimeZone
     }
   }
 ]

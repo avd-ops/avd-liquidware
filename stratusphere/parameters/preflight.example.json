@@ -19,6 +19,6 @@
 
   "HostPoolName": "hp-avdlz-dev",
   "HostPoolResourceGroup": "rg-avdlz-dev-avd",
-  "_avdCurrentState": "Optional: a package from github.com/nickprignano/avd-current-state (folder or zip).",
+  "_avdCurrentState": "Optional: a package from github.com/avd-ops/avd-current-state (folder or zip).",
   "AvdCurrentStatePath": ""
 }

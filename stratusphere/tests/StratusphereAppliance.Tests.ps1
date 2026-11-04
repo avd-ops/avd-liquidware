@@ -22,6 +22,30 @@ Describe 'Get-SsuxApplianceSpec and role tags' {
   }
 }
 
+Describe 'Get-SsuxResourceGroupName and Get-SsuxSandboxDeadlineConfig' {
+  It 'builds rg-<prefix>-stratusphere by default and rg-<prefix>-<env>-stratusphere when -Environment is set' {
+    Get-SsuxResourceGroupName -NamePrefix 'ssux' | Should -Be 'rg-ssux-stratusphere'
+    Get-SsuxResourceGroupName -NamePrefix 'ssux' -Environment 'dev' | Should -Be 'rg-ssux-dev-stratusphere'
+  }
+  It 'computes deterministic deadline schedule names, storage account and tags' {
+    $now = [datetime]::Parse('2026-11-03T18:00:00Z').ToUniversalTime()
+    $cfg = Get-SsuxSandboxDeadlineConfig -SubscriptionId '00000000-0000-0000-0000-000000000001' -NamePrefix 'ssux' -Environment 'dev' `
+      -BatchId 'b20261103-1800' -ShutdownAfterMinutes 120 -TeardownAfterMinutes 240 -NowUtc $now
+    $cfg.ResourceGroupName | Should -Be 'rg-ssux-dev-stratusphere'
+    $cfg.ResourceGroupPrefix | Should -Match '^rg-[a-z0-9]{2,8}-(dev|test|prod)-$'
+    $cfg.StorageAccount | Should -Match '^avdlzruns[0-9a-f]{12}$'
+    $cfg.ShutdownScheduleName | Should -Be 'ssux-shutdown-ssux-b20261103-1800-G1'
+    $cfg.TeardownScheduleName | Should -Be 'ssux-teardown-ssux-b20261103-1800-G2'
+    $cfg.ShutdownUtc | Should -Be '2026-11-03T20:00:00Z'
+    $cfg.TeardownUtc | Should -Be '2026-11-03T22:00:00Z'
+    $cfg.ShutdownResultsBlob | Should -Match '^queue/[0-9]{4}-[0-9]{2}/b[0-9]{8}-[0-9]{4}/results-G1\.json$'
+    $cfg.TeardownResultsBlob | Should -Match '^queue/[0-9]{4}-[0-9]{2}/b[0-9]{8}-[0-9]{4}/results-G2\.json$'
+    $cfg.Tags['avdlz-component'] | Should -Be 'stratusphere-ux'
+    $cfg.Tags['avdlz-shutdown-schedule'] | Should -Be 'ssux-shutdown-ssux-b20261103-1800-G1'
+    $cfg.Tags['avdlz-teardown-schedule'] | Should -Be 'ssux-teardown-ssux-b20261103-1800-G2'
+  }
+}
+
 Describe 'Get-SsuxApplianceArgumentError' {
   It 'rejects a bad prefix, plan or peer ID' {
     @(Get-SsuxApplianceArgumentError -Action Deploy -NamePrefix 'Lab_1').Count | Should -Be 1
@@ -84,7 +108,7 @@ Describe 'Get-SsuxApplianceHealth' {
     $r[2].Detail | Should -Be 'VM not found'
   }
   It 'warns, without a fix, while a VM is starting' {
-    $r = Get-SsuxApplianceHealth -Spec @($script:spec[0]) -Vm @(Get-Vm 'vm-lab-hub' '10.60.0.4' -Power 'VM starting')
+    $r = @(Get-SsuxApplianceHealth -Spec @($script:spec[0]) -Vm @(Get-Vm 'vm-lab-hub' '10.60.0.4' -Power 'VM starting'))
     $r.Status | Should -Be 'WARN'
     $r.Remedy | Should -BeNullOrEmpty
   }

@@ -43,6 +43,7 @@ param(
   [ValidateSet('Hub', 'Database', 'Collector')] [string[]] $Role = @(),
   [string] $Location = 'eastus2',
   [string] $NamePrefix = 'ssux',
+  [ValidateSet('', 'dev', 'test', 'prod')] [string] $Environment = '',
   [string] $HubPlan = '',
   [string] $DatabasePlan = '',
   [string] $CollectorPlan = '',
@@ -51,13 +52,21 @@ param(
   [string] $HubVmSize = '',
   [string] $PeerVnetId = '',
   [switch] $NoBastion,
+  [string] $AutoShutdownTime = '2000',
+  # Optional deadline auto-shutdown (G1 Deallocate) and auto-teardown (G2 Delete) in aa-avdlz-runs.
+  [ValidateRange(0, 1440)] [int] $ShutdownAfterMinutes = 0,
+  [ValidateRange(0, 1440)] [int] $TeardownAfterMinutes = 0,
+  [string] $BatchId = '',
+  # On Cleanup: deallocate VMs to stop the compute meter while keeping disks, VNet and Key Vault.
+  [switch] $DeallocateOnly,
   [string] $ParameterFile = '',
   # Cleanup without asking.
   [switch] $Force,
   # Cleanup of the Hub or Database: remove them although they hold the only copy of the assessment
   # data (decision 0016 in avd-second-brain). -Force never implies it.
   [switch] $DiscardLastCopy,
-  [string] $OutputPath = ''
+  [string] $OutputPath = '',
+  [ValidateSet('Bicep', 'Terraform')] [string] $Engine = 'Bicep'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -68,13 +77,20 @@ Import-Module (Join-Path $PSScriptRoot 'StratusphereAppliance.psm1') -Force
 
 $publisher = 'liquidware'
 $offer = 'stratusphere'
-$rgName = "rg-$NamePrefix-stratusphere"
+$rgName = Get-SsuxResourceGroupName -NamePrefix $NamePrefix -Environment $Environment
 $askedPlan = @{ Hub = $HubPlan; Database = $DatabasePlan; Collector = $CollectorPlan }
 $peerGiven = $PSBoundParameters.ContainsKey('PeerVnetId')
+$useDeadline = ($ShutdownAfterMinutes -gt 0 -or $TeardownAfterMinutes -gt 0)
 
 $argErrors = @(Get-SsuxApplianceArgumentError -Action $Action -Role $Role -NamePrefix $NamePrefix -Plan $askedPlan -PeerVnetId $PeerVnetId)
 if ($HubVmSize -and $HubVmSize -notmatch '^Standard_[A-Za-z0-9_]+$') { $argErrors += "Not a VM size: '$HubVmSize'" }
 if ($ImageVersion -and $ImageVersion -notmatch '^(latest|[0-9.]+)$') { $argErrors += "Not an image version: '$ImageVersion'" }
+if ($useDeadline -and -not $Environment) {
+  $argErrors += 'Pass -Environment (dev, test or prod) when using -ShutdownAfterMinutes or -TeardownAfterMinutes so Invoke-AvdSandboxDeadline matches rg-<prefix>-<env>-*.'
+}
+if ($BatchId -and $BatchId -notmatch '^b[0-9]{8}-[0-9]{4}$') {
+  $argErrors += "BatchId '$BatchId' must match bYYYYMMDD-HHmm."
+}
 if ($argErrors.Count -gt 0) {
   $argErrors | ForEach-Object { Write-Host "FAIL   $_" }
   Write-Host 'RESULT FAIL invalid arguments'
@@ -147,6 +163,121 @@ function Get-NetworkState {
   }
 }
 
+# ---------- Sandbox deadline schedules (aa-avdlz-runs) ----------
+function Register-SandboxDeadline {
+  [CmdletBinding(SupportsShouldProcess)]
+  param([switch] $WhatIfOnly)
+  if (-not $useDeadline) { return $null }
+  $shutMin = $(if ($ShutdownAfterMinutes -gt 0) { $ShutdownAfterMinutes } else { 120 })
+  $tearMin = $(if ($TeardownAfterMinutes -gt 0) { $TeardownAfterMinutes } else { 240 })
+  $cfg = Get-SsuxSandboxDeadlineConfig -SubscriptionId $context.Subscription.Id -NamePrefix $NamePrefix -Environment $Environment `
+    -BatchId $BatchId -ShutdownAfterMinutes $shutMin -TeardownAfterMinutes $tearMin
+  $aaBase = "/subscriptions/$($cfg.SubscriptionId)/resourceGroups/$($cfg.AutomationRg)/providers/Microsoft.Automation/automationAccounts/$($cfg.AutomationAccount)"
+  $rbResp = Invoke-AzRestMethod -Method GET -Path "$aaBase/runbooks/$($cfg.RunbookName)?api-version=2023-11-01"
+  if ($rbResp.StatusCode -ne 200) {
+    Add-Result (Get-SsuxCheckResult FAIL 'sandbox-deadline' "Runbook $($cfg.AutomationAccount)/$($cfg.RunbookName) not found in $($cfg.AutomationRg) (HTTP $($rbResp.StatusCode))")
+    return $null
+  }
+  $rb = $rbResp.Content | ConvertFrom-Json
+  if ($rb.properties.state -ne 'Published') {
+    Add-Result (Get-SsuxCheckResult FAIL 'sandbox-deadline' "Runbook $($cfg.RunbookName) state is '$($rb.properties.state)', expected 'Published'")
+    return $null
+  }
+  if ($WhatIfOnly) {
+    Add-Result (Get-SsuxCheckResult PASS 'sandbox-deadline' "Would arm $($cfg.ShutdownScheduleName) ($($cfg.ShutdownUtc)) and $($cfg.TeardownScheduleName) ($($cfg.TeardownUtc)) in $($cfg.AutomationAccount)")
+    return $cfg
+  }
+  if (-not $PSCmdlet.ShouldProcess($cfg.AutomationAccount, "Arm deadline schedules for $($cfg.ResourceGroupPrefix)")) { return $cfg }
+
+  $specs = @()
+  if ($ShutdownAfterMinutes -gt 0) {
+    $specs += [pscustomobject]@{
+      ScheduleName = $cfg.ShutdownScheduleName; StartTime = $cfg.ShutdownUtc; Group = 'G1'
+      Action = 'Deallocate'; ResultsBlob = $cfg.ShutdownResultsBlob; Description = "Auto-deallocate $($cfg.ResourceGroupPrefix)*"
+    }
+  }
+  if ($TeardownAfterMinutes -gt 0) {
+    $specs += [pscustomobject]@{
+      ScheduleName = $cfg.TeardownScheduleName; StartTime = $cfg.TeardownUtc; Group = 'G2'
+      Action = 'Delete'; ResultsBlob = $cfg.TeardownResultsBlob; Description = "Auto-delete $($cfg.ResourceGroupPrefix)*"
+    }
+  }
+  foreach ($s in $specs) {
+    $schedBody = @{
+      properties = @{
+        description = $s.Description
+        startTime   = $s.StartTime
+        frequency   = 'OneTime'
+        timeZone    = 'UTC'
+      }
+    } | ConvertTo-Json -Depth 5
+    $sResp = Invoke-AzRestMethod -Method PUT -Path "$aaBase/schedules/$($s.ScheduleName)?api-version=2023-11-01" -Payload $schedBody
+    if ($sResp.StatusCode -notin 200, 201) {
+      throw "Failed to create schedule $($s.ScheduleName) (HTTP $($sResp.StatusCode)): $($sResp.Content)"
+    }
+    $jsId = [guid]::NewGuid().ToString()
+    $jsBody = @{
+      properties = @{
+        schedule   = @{ name = $s.ScheduleName }
+        runbook    = @{ name = $cfg.RunbookName }
+        parameters = @{
+          SubscriptionId      = $cfg.SubscriptionId
+          StorageAccount      = $cfg.StorageAccount
+          ResultsBlob         = $s.ResultsBlob
+          BatchId             = $cfg.BatchId
+          Group               = $s.Group
+          ResourceGroupPrefix = $cfg.ResourceGroupPrefix
+          Action              = $s.Action
+        }
+      }
+    } | ConvertTo-Json -Depth 6
+    $jResp = Invoke-AzRestMethod -Method PUT -Path "$aaBase/jobSchedules/${jsId}?api-version=2023-11-01" -Payload $jsBody
+    if ($jResp.StatusCode -notin 200, 201) {
+      throw "Failed to link jobSchedule for $($s.ScheduleName) (HTTP $($jResp.StatusCode)): $($jResp.Content)"
+    }
+    Add-Result (Get-SsuxCheckResult FIXED 'sandbox-deadline' "Armed $($s.ScheduleName) ($($s.Action) at $($s.StartTime))")
+  }
+  $cfg
+}
+
+function Unregister-SandboxDeadline {
+  [CmdletBinding(SupportsShouldProcess)]
+  param()
+  $subId = $context.Subscription.Id
+  $aaBase = "/subscriptions/$subId/resourceGroups/avdlz-runs-rg/providers/Microsoft.Automation/automationAccounts/aa-avdlz-runs"
+  $jsResp = Invoke-AzRestMethod -Method GET -Path "$aaBase/jobSchedules?api-version=2023-11-01"
+  $pattern = "^ssux-(shutdown|teardown)-$([regex]::Escape($NamePrefix))-"
+  $disarmed = @()
+  if ($jsResp.StatusCode -eq 200) {
+    $jsList = @(($jsResp.Content | ConvertFrom-Json).value)
+    foreach ($js in $jsList) {
+      $sName = [string]$js.properties.schedule.name
+      if ($sName -match $pattern) {
+        $jsId = $js.properties.jobScheduleId
+        if (-not $jsId) { $jsId = ($js.id -split '/')[-1] }
+        if ($PSCmdlet.ShouldProcess("jobSchedule/$jsId ($sName)", 'Remove Automation jobSchedule')) {
+          Invoke-AzRestMethod -Method DELETE -Path "$aaBase/jobSchedules/${jsId}?api-version=2023-11-01" | Out-Null
+        }
+      }
+    }
+  }
+  $sResp = Invoke-AzRestMethod -Method GET -Path "$aaBase/schedules?api-version=2023-11-01"
+  if ($sResp.StatusCode -eq 200) {
+    $sList = @(($sResp.Content | ConvertFrom-Json).value)
+    foreach ($s in $sList) {
+      if ($s.name -match $pattern) {
+        if ($PSCmdlet.ShouldProcess($s.name, 'Remove Automation schedule')) {
+          Invoke-AzRestMethod -Method DELETE -Path "$aaBase/schedules/$($s.name)?api-version=2023-11-01" | Out-Null
+          $disarmed += $s.name
+        }
+      }
+    }
+  }
+  if ($disarmed.Count -gt 0) {
+    Add-Result (Get-SsuxCheckResult FIXED 'sandbox-deadline' "Disarmed $($disarmed -join ', ') in aa-avdlz-runs")
+  }
+}
+
 function Invoke-Check([object[]] $Existing) {
   if (-not (Get-AzResourceGroup -Name $rgName -ErrorAction SilentlyContinue)) {
     Add-Result ([pscustomobject]@{ Status = 'FAIL'; Check = 'resource-group'; Detail = "$rgName does not exist"; Remedy = 'deploy'; Name = '' })
@@ -191,7 +322,7 @@ function Use-BicepCli {
   $azBicep = Join-Path $HOME '.azure/bin/bicep'
   if (-not (Test-Path $azBicep) -and (Get-Command az -ErrorAction SilentlyContinue)) { az bicep install | Out-Null }
   if (-not (Test-Path $azBicep)) { throw 'The Bicep CLI is needed to read the .bicepparam file. Run: az bicep install' }
-  $env:PATH = (Split-Path $azBicep) + [IO.Path]::PathSeparator + $env:PATH
+  $env:PATH = $env:PATH + [IO.Path]::PathSeparator + (Split-Path $azBicep)
 }
 
 function Confirm-Plan([hashtable] $Plans) {
@@ -265,6 +396,12 @@ function Invoke-Deployment {
   }
   if (-not (Confirm-Plan $target.Plan)) { return $null }
 
+  $deadlineCfg = $null
+  if ($useDeadline) {
+    $deadlineCfg = Register-SandboxDeadline -WhatIfOnly:$WhatIfOnly
+    if (-not $deadlineCfg) { return $null }
+  }
+
   # Keep what the environment already has unless asked otherwise: dropping the Bastion
   # subnet under a running Bastion, or the peering, would fail or disconnect the endpoints.
   $net = Get-NetworkState
@@ -278,11 +415,44 @@ function Invoke-Deployment {
 
   if (-not $WhatIfOnly) { Restore-Vault }
   $password = Resolve-AdminPassword $Existing -ForWhatIf:$WhatIfOnly
+  if ($Engine -eq 'Terraform') {
+    if (-not (Get-Command terraform -ErrorAction SilentlyContinue)) { throw 'The Terraform CLI is needed for -Engine Terraform. Install terraform (>= 1.9) or use -Engine Bicep.' }
+    $tfDir = Join-Path $repoRoot 'terraform'
+    $tfVars = Get-SsuxTerraformVariable -NamePrefix $NamePrefix -Environment $Environment -Location $Location -Target $target -KeyVaultReaderObjectId $reader `
+      -ImageVersion $ImageVersion -HubVmSize $HubVmSize -AutoShutdownTime $AutoShutdownTime -PeerVnetId $peer -DeployBastion ($bastion -eq 'true') -DeadlineConfig $deadlineCfg
+    $varFile = Join-Path ([System.IO.Path]::GetTempPath()) "ssux-tf-$PID.tfvars.json"
+    $tfVars | ConvertTo-Json -Depth 5 | Set-Content -Path $varFile -Encoding utf8NoBOM -WhatIf:$false
+    try {
+      $env:TF_VAR_adminPassword = $password
+      & terraform "-chdir=$tfDir" init -input=false | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw 'terraform init failed in stratusphere/terraform.' }
+      if ($WhatIfOnly) {
+        & terraform "-chdir=$tfDir" plan -input=false "-var-file=$varFile"
+        if ($LASTEXITCODE -ne 0) { throw 'terraform plan failed in stratusphere/terraform.' }
+        return $null
+      }
+      if (-not $PSCmdlet.ShouldProcess($rgName, "Deploy $($roles -join ', ') (Terraform)")) { return $null }
+      Write-Host 'Deploying with Terraform (Bastion takes several minutes the first time) ...'
+      & terraform "-chdir=$tfDir" apply -auto-approve -input=false "-var-file=$varFile"
+      if ($LASTEXITCODE -ne 0) { throw 'terraform apply failed in stratusphere/terraform.' }
+      Add-Result (Get-SsuxCheckResult FIXED 'deployment' 'terraform apply succeeded')
+      return (& terraform "-chdir=$tfDir" output -json | ConvertFrom-Json)
+    }
+    finally {
+      Remove-Item 'env:TF_VAR_adminPassword' -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath $varFile -Force -ErrorAction SilentlyContinue
+    }
+  }
   $vars = @{
-    SSUX_NAME_PREFIX = $NamePrefix; SSUX_LOCATION = $Location; SSUX_IMAGE_VERSION = $ImageVersion; SSUX_HUB_VM_SIZE = $HubVmSize
+    SSUX_NAME_PREFIX = $NamePrefix; SSUX_ENVIRONMENT = $Environment; SSUX_LOCATION = $Location; SSUX_IMAGE_VERSION = $ImageVersion; SSUX_HUB_VM_SIZE = $HubVmSize
     SSUX_DEPLOY_HUB = ([string]$target.DeployHub).ToLower(); SSUX_HUB_PLAN = $target.Plan['Hub']
     SSUX_DEPLOY_DATABASE = ([string]$target.DeployDatabase).ToLower(); SSUX_DATABASE_PLAN = [string]$target.Plan['Database']
     SSUX_COLLECTOR_COUNT = [string]$target.CollectorCount; SSUX_COLLECTOR_PLAN = [string]$target.Plan['Collector']
+    SSUX_AUTO_SHUTDOWN_TIME = $AutoShutdownTime
+    SSUX_SHUTDOWN_UTC = $(if ($deadlineCfg) { $deadlineCfg.ShutdownUtc } else { '' })
+    SSUX_TEARDOWN_UTC = $(if ($deadlineCfg) { $deadlineCfg.TeardownUtc } else { '' })
+    SSUX_SHUTDOWN_SCHEDULE = $(if ($deadlineCfg) { $deadlineCfg.ShutdownScheduleName } else { '' })
+    SSUX_TEARDOWN_SCHEDULE = $(if ($deadlineCfg) { $deadlineCfg.TeardownScheduleName } else { '' })
     SSUX_PEER_VNET_ID = $peer; SSUX_DEPLOY_BASTION = $bastion; SSUX_KV_READER_ID = $reader; SSUX_ADMIN_PASSWORD = $password
   }
   Use-BicepCli
@@ -308,18 +478,30 @@ function Invoke-Deployment {
 function Remove-RemotePeering {
   [CmdletBinding(SupportsShouldProcess)]
   param()
-  # The template creates the peering on the other VNet too; deleting the resource group
-  # would leave it behind, disconnected.
+  # Step 1 of peered teardown: remove the peering link on the remote VNet
+  # before deleting the Stratusphere resource group so no Disconnected peering is left behind.
+  $targetVnetSuffix = "/resourceGroups/$rgName/providers/Microsoft.Network/virtualNetworks/vnet-$NamePrefix-stratusphere"
+  $candidateVnets = [System.Collections.Generic.List[object]]::new()
   $net = Get-NetworkState
-  if (-not $net) { return }
-  foreach ($p in @($net.Vnet.VirtualNetworkPeerings)) {
-    $parts = $p.RemoteVirtualNetwork.Id -split '/'
-    $remote = @(Get-AzVirtualNetworkPeering -VirtualNetworkName $parts[8] -ResourceGroupName $parts[4] -ErrorAction SilentlyContinue |
-        Where-Object { $_.RemoteVirtualNetwork.Id -eq $net.Vnet.Id })
+  if ($net) {
+    foreach ($p in @($net.Vnet.VirtualNetworkPeerings)) {
+      $parts = $p.RemoteVirtualNetwork.Id -split '/'
+      $rv = Get-AzVirtualNetwork -ResourceGroupName $parts[4] -Name $parts[8] -ErrorAction SilentlyContinue
+      if ($rv) { $candidateVnets.Add($rv) }
+    }
+  }
+  if ($PeerVnetId) {
+    $parts = $PeerVnetId -split '/'
+    $rv = Get-AzVirtualNetwork -ResourceGroupName $parts[4] -Name $parts[8] -ErrorAction SilentlyContinue
+    if ($rv -and @($candidateVnets | Where-Object Id -eq $rv.Id).Count -eq 0) { $candidateVnets.Add($rv) }
+  }
+  foreach ($rv in $candidateVnets) {
+    $remote = @(Get-AzVirtualNetworkPeering -VirtualNetworkName $rv.Name -ResourceGroupName $rv.ResourceGroupName -ErrorAction SilentlyContinue |
+        Where-Object { $_.RemoteVirtualNetwork.Id -like "*$targetVnetSuffix" })
     foreach ($r in $remote) {
-      if (-not $PSCmdlet.ShouldProcess("$($parts[8])/$($r.Name)", 'Remove peering')) { continue }
-      Remove-AzVirtualNetworkPeering -VirtualNetworkName $parts[8] -ResourceGroupName $parts[4] -Name $r.Name -Force
-      Write-Host "Removed peering $($r.Name) from $($parts[8])"
+      if (-not $PSCmdlet.ShouldProcess("$($rv.Name)/$($r.Name)", 'Remove peering')) { continue }
+      Remove-AzVirtualNetworkPeering -VirtualNetworkName $rv.Name -ResourceGroupName $rv.ResourceGroupName -Name $r.Name -Force
+      Write-Host "Removed peering $($r.Name) from $($rv.Name)"
     }
   }
 }
@@ -399,27 +581,45 @@ switch ($Action) {
     }
   }
   'Cleanup' {
-    $plan = Get-SsuxCleanupPlan -Role $Role -Existing $existing -ResourceGroupName $rgName -DiscardLastCopy:$DiscardLastCopy
-    $plan.Notes | ForEach-Object { Write-Host "NOTE   $_" }
-    if ($plan.Blocked) { Add-Result (Get-SsuxCheckResult FAIL 'last-copy' "$($plan.Blocked) Nothing was removed.") }
-    elseif ($plan.Scope -eq 'ResourceGroup') {
-      if (-not (Get-AzResourceGroup -Name $rgName -ErrorAction SilentlyContinue)) { Add-Result (Get-SsuxCheckResult PASS 'cleanup' "$rgName does not exist") }
-      elseif ($PSCmdlet.ShouldProcess($rgName, 'Remove the resource group and everything in it') -and
-        ($Force -or $PSCmdlet.ShouldContinue("Remove $rgName and every appliance, disk and secret in it?", 'Cleanup'))) {
-        Remove-RemotePeering
-        Remove-AzResourceGroup -Name $rgName -Force | Out-Null
-        Add-Result (Get-SsuxCheckResult FIXED 'cleanup' "Removed $rgName")
-      }
-    }
-    elseif ($plan.Target.Count -eq 0) { Add-Result (Get-SsuxCheckResult PASS 'cleanup' "No $($Role -join ' or ') appliances to remove") }
-    elseif ($Force -or $WhatIfPreference -or $PSCmdlet.ShouldContinue("Remove $($plan.Target -join ', ') with their disks and NICs?", 'Cleanup')) {
-      foreach ($vm in $plan.Target) {
-        if ($PSCmdlet.ShouldProcess($vm, 'Remove VM with its disk and NIC')) {
-          Remove-AzVM -ResourceGroupName $rgName -Name $vm -Force | Out-Null
-          Add-Result (Get-SsuxCheckResult FIXED 'cleanup' "Removed $vm")
+    if ($DeallocateOnly) {
+      if ($existing.Count -eq 0) { Add-Result (Get-SsuxCheckResult PASS 'deallocate' "No appliances in $rgName") }
+      else {
+        foreach ($vm in $existing) {
+          if ($PSCmdlet.ShouldProcess($vm.Name, 'Deallocate VM (stop compute meter)')) {
+            Stop-AzVM -ResourceGroupName $rgName -Name $vm.Name -Force | Out-Null
+            Add-Result (Get-SsuxCheckResult FIXED 'deallocate' "Deallocated $($vm.Name)")
+          }
         }
       }
-      Write-Host 'Run -Action Fix (or Deploy) afterwards to drop NSG rules the remaining roles no longer need.'
+    }
+    else {
+      $plan = Get-SsuxCleanupPlan -Role $Role -Existing $existing -ResourceGroupName $rgName -DiscardLastCopy:$DiscardLastCopy
+      $plan.Notes | ForEach-Object { Write-Host "NOTE   $_" }
+      if ($plan.Blocked) { Add-Result (Get-SsuxCheckResult FAIL 'last-copy' "$($plan.Blocked) Nothing was removed.") }
+      elseif ($plan.Scope -eq 'ResourceGroup') {
+        if (-not (Get-AzResourceGroup -Name $rgName -ErrorAction SilentlyContinue)) {
+          Remove-RemotePeering
+          Unregister-SandboxDeadline
+          Add-Result (Get-SsuxCheckResult PASS 'cleanup' "$rgName does not exist")
+        }
+        elseif ($PSCmdlet.ShouldProcess($rgName, 'Remove the resource group and everything in it') -and
+          ($Force -or $PSCmdlet.ShouldContinue("Remove $rgName and every appliance, disk and secret in it?", 'Cleanup'))) {
+          Remove-RemotePeering
+          Remove-AzResourceGroup -Name $rgName -Force | Out-Null
+          Unregister-SandboxDeadline
+          Add-Result (Get-SsuxCheckResult FIXED 'cleanup' "Removed $rgName")
+        }
+      }
+      elseif ($plan.Target.Count -eq 0) { Add-Result (Get-SsuxCheckResult PASS 'cleanup' "No $($Role -join ' or ') appliances to remove") }
+      elseif ($Force -or $WhatIfPreference -or $PSCmdlet.ShouldContinue("Remove $($plan.Target -join ', ') with their disks and NICs?", 'Cleanup')) {
+        foreach ($vm in $plan.Target) {
+          if ($PSCmdlet.ShouldProcess($vm, 'Remove VM with its disk and NIC')) {
+            Remove-AzVM -ResourceGroupName $rgName -Name $vm -Force | Out-Null
+            Add-Result (Get-SsuxCheckResult FIXED 'cleanup' "Removed $vm")
+          }
+        }
+        Write-Host 'Run -Action Fix (or Deploy) afterwards to drop NSG rules the remaining roles no longer need.'
+      }
     }
   }
 }

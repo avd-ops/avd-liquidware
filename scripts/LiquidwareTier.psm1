@@ -70,7 +70,9 @@ function Get-LwName {
     Vnet                   = "vnet-$base"
     HostPool               = "vdpool-$base"
     AppGroup               = "vdag-$base-desktop"
+    ScalingPlan            = "vdscaling-$base"
     LogAnalytics           = "log-$base"
+    AutomationAccount      = "aa-$base"
     TierGroup              = "rg-$base-liquidware"
     TierVnet               = "vnet-$base-liquidware"
     PeeringToTier          = "peer-$base-to-liquidware"
@@ -90,7 +92,10 @@ function Get-LwLandingZone {
     [Parameter(Mandatory)] [string] $Environment,
     [AllowEmptyCollection()] [string[]] $ResourceGroup = @(),
     [AllowEmptyCollection()] [object[]] $Resource = @(),
-    $Vnet = $null
+    $Vnet = $null,
+    [string] $HostPoolName = '',
+    [string] $FileDnsZoneId = '',
+    [string] $VaultDnsZoneId = ''
   )
   $n = Get-LwName -NamePrefix $NamePrefix -Environment $Environment
   $missing = [System.Collections.Generic.List[string]]::new()
@@ -107,11 +112,19 @@ function Get-LwLandingZone {
   $profiles = Find-One 'Microsoft.Storage/storageAccounts' $rg.Storage -Kind 'FileStorage'
   $keyVault = Find-One 'Microsoft.KeyVault/vaults' $rg.Management
   $law = Find-One 'Microsoft.OperationalInsights/workspaces' $rg.Management $n.LogAnalytics
-  $hostPool = Find-One 'Microsoft.DesktopVirtualization/hostPools' $rg.ControlPlane $n.HostPool
-  $appGroup = Find-One 'Microsoft.DesktopVirtualization/applicationGroups' $rg.ControlPlane $n.AppGroup
+  $automation = Find-One 'Microsoft.Automation/automationAccounts' $rg.Management $n.AutomationAccount
+  $hostPools = @($Resource | Where-Object { $_ -and $_.ResourceType -eq 'Microsoft.DesktopVirtualization/hostPools' -and $_.ResourceGroupName -eq $rg.ControlPlane })
+  $appGroups = @($Resource | Where-Object { $_ -and $_.ResourceType -eq 'Microsoft.DesktopVirtualization/applicationGroups' -and $_.ResourceGroupName -eq $rg.ControlPlane })
+  $targetPoolName = $(if ($HostPoolName) { $HostPoolName } else { $n.HostPool })
+  $hostPool = @($hostPools | Where-Object Name -eq $targetPoolName) | Select-Object -First 1
+  if (-not $hostPool -and -not $HostPoolName -and $hostPools.Count -gt 0) { $hostPool = $hostPools[0] }
+  $appGroup = @($appGroups | Where-Object Name -eq $n.AppGroup) | Select-Object -First 1
+  if (-not $appGroup -and $appGroups.Count -gt 0) { $appGroup = $appGroups[0] }
   $zones = @($Resource | Where-Object { $_ -and $_.ResourceType -eq 'Microsoft.Network/privateDnsZones' -and $_.ResourceGroupName -eq $rg.Network })
   $fileZone = @($zones | Where-Object Name -like 'privatelink.file.*') | Select-Object -First 1
   $vaultZone = @($zones | Where-Object Name -like 'privatelink.vaultcore.*') | Select-Object -First 1
+  $resolvedFileZoneId = $(if ($FileDnsZoneId) { $FileDnsZoneId } elseif ($fileZone) { $fileZone.ResourceId } else { $null })
+  $resolvedVaultZoneId = $(if ($VaultDnsZoneId) { $VaultDnsZoneId } elseif ($vaultZone) { $vaultZone.ResourceId } else { $null })
 
   if (-not $Vnet) { $missing.Add("virtual network $($n.Vnet)") }
   $hostSubnet = $null
@@ -125,11 +138,13 @@ function Get-LwLandingZone {
   if (-not $profiles) { $missing.Add("profiles storage account (FileStorage) in $($rg.Storage)") }
   if (-not $keyVault) { $missing.Add("Key Vault in $($rg.Management)") }
   if (-not $law) { $missing.Add("Log Analytics workspace $($n.LogAnalytics)") }
-  if (-not $hostPool) { $missing.Add("host pool $($n.HostPool)") }
+  if (-not $hostPool) { $missing.Add("host pool $targetPoolName") }
   if (-not $appGroup) { $missing.Add("application group $($n.AppGroup)") }
 
-  # Standalone landing zones own their privatelink zones; HubPeered ones use the platform's (no local zones).
-  $mode = $(if ($fileZone) { 'Standalone' } else { 'HubPeered' })
+  # In avd-landing-zone, HubPeered spokes attach a route table (rt-vnet-<base>-hosts) to snet-session-hosts
+  # or use central privatelink zones, while Standalone spokes attach ng-vnet-<base> and local zones.
+  $hasRouteTable = [bool]($hostSubnet -and $hostSubnet.PSObject.Properties['RouteTableId'] -and $hostSubnet.RouteTableId)
+  $mode = $(if ($hasRouteTable -or -not $resolvedFileZoneId) { 'HubPeered' } else { 'Standalone' })
   [pscustomobject]@{
     Names                       = $n
     ConnectivityMode            = $mode
@@ -142,10 +157,13 @@ function Get-LwLandingZone {
     ProfilesAccountId           = $(if ($profiles) { $profiles.ResourceId } else { $null })
     KeyVaultId                  = $(if ($keyVault) { $keyVault.ResourceId } else { $null })
     LogAnalyticsId              = $(if ($law) { $law.ResourceId } else { $null })
+    AutomationAccountId         = $(if ($automation) { $automation.ResourceId } else { $null })
     HostPoolId                  = $(if ($hostPool) { $hostPool.ResourceId } else { $null })
+    HostPools                   = @($hostPools | ForEach-Object { $_.ResourceId })
     AppGroupId                  = $(if ($appGroup) { $appGroup.ResourceId } else { $null })
-    FileDnsZoneId               = $(if ($fileZone) { $fileZone.ResourceId } else { $null })
-    VaultDnsZoneId              = $(if ($vaultZone) { $vaultZone.ResourceId } else { $null })
+    AppGroups                   = @($appGroups | ForEach-Object { $_.ResourceId })
+    FileDnsZoneId               = $resolvedFileZoneId
+    VaultDnsZoneId              = $resolvedVaultZoneId
     Missing                     = $missing.ToArray()
   }
 }

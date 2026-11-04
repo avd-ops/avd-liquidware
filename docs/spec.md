@@ -2,8 +2,8 @@
 
 - **Status:** Proposed (see [decision AL-0001](decisions/AL-0001-optional-tier.md)). Red-teamed twice in [redteam.md](redteam.md); every finding is folded in below and tagged with its ID (C1, H2, N-C1, …).
 - **Date:** 2026-10-18
-- **Numbering:** plain decision and lesson numbers (decision 0001, lesson 0028) are [avd-landing-zone](https://github.com/nickprignano/avd-landing-zone)'s; this repo's own decisions are AL-NNNN.
-- **Scope:** an opt-in tier on top of what [avd-landing-zone](https://github.com/nickprignano/avd-landing-zone) deploys today, plus a delivery pattern for customer environments run by Nerdio Manager for Enterprise. The tier is its own deployment, run against an existing landing zone, so avd-landing-zone's default deployment never changes. Nothing is built by this spec.
+- **Numbering:** plain decision and lesson numbers (decision 0001, lesson 0028) are [avd-landing-zone](https://github.com/avd-ops/avd-landing-zone)'s; this repo's own decisions are AL-NNNN.
+- **Scope:** an opt-in tier on top of what [avd-landing-zone](https://github.com/avd-ops/avd-landing-zone) deploys today, plus a delivery pattern for customer environments run by Nerdio Manager for Enterprise. The tier is its own deployment, run against an existing landing zone, so avd-landing-zone's default deployment never changes. Nothing is built by this spec.
 
 This is a personal project, not for production, provided as is. Nothing here has run against a real tenant. §12 lists every vendor fact this spec relies on, where it came from, and what is still unverified. Liquidware, ProfileUnity, FlexApp, FlexApp One, Stratusphere and CommandCTRL are trademarks of Liquidware; this project is not affiliated with Liquidware or Nerdio.
 

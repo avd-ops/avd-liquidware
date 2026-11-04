@@ -1,0 +1,21 @@
+# Lab assessment environment example (values that differ per subscription come from TF_VAR_* or -var).
+# Personal project, not for production use. Provided as is, without warranty of any kind (MIT License, see LICENSE at the repo root). Not affiliated with the author's employer, with Liquidware or with Microsoft.
+
+namePrefix   = "ssux"
+location     = "eastus2"
+tags         = { environment = "lab" }
+imageVersion = "latest"
+
+deployHub    = true
+hubImagePlan = "set-hub-image-plan"
+hubVmSize    = "Standard_D4s_v5"
+
+deployDatabase    = false
+databaseImagePlan = ""
+
+collectorCount     = 0
+collectorImagePlan = ""
+
+peerVirtualNetworkResourceId = ""
+deployBastion                = true
+keyVaultReaderObjectId       = "00000000-0000-0000-0000-000000000000"

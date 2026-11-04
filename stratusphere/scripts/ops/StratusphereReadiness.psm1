@@ -314,7 +314,7 @@ function Get-SsuxEndpointSizingCheck {
 
 function Get-SsuxAvdCurrentStateSummary {
   # Reads what a preflight needs from an avd-current-state collector package
-  # (github.com/nickprignano/avd-current-state): session hosts and VNet address spaces.
+  # (github.com/avd-ops/avd-current-state): session hosts and VNet address spaces.
   [CmdletBinding()]
   param(
     [AllowEmptyCollection()] [object[]] $SessionHost = @(),

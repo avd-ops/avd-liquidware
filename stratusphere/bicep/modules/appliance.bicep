@@ -23,6 +23,12 @@ param adminUsername string
 @secure()
 param adminPassword string
 
+@description('Daily auto-shutdown time in HHmm (24-hour), or empty to skip the DevTestLab schedule.')
+param autoShutdownTime string = '2000'
+
+@description('Windows time zone ID for the daily auto-shutdown schedule.')
+param autoShutdownTimeZone string = 'Central Standard Time'
+
 module vm 'br/public:avm/res/compute/virtual-machine:0.22.3' = {
   name: 'vm-${role}'
   params: {
@@ -70,6 +76,24 @@ module vm 'br/public:avm/res/compute/virtual-machine:0.22.3' = {
       }
     ]
     bootDiagnostics: true
+  }
+}
+
+resource autoShutdown 'Microsoft.DevTestLab/schedules@2018-09-15' = if (!empty(autoShutdownTime)) {
+  name: 'shutdown-computevm-${name}'
+  location: location
+  tags: tags
+  properties: {
+    status: 'Enabled'
+    taskType: 'ComputeVmShutdownTask'
+    dailyRecurrence: {
+      time: autoShutdownTime
+    }
+    timeZoneId: autoShutdownTimeZone
+    notificationSettings: {
+      status: 'Disabled'
+    }
+    targetResourceId: vm.outputs.resourceId
   }
 }
 

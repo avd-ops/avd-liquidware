@@ -19,9 +19,9 @@ The shared Liquidware knowledge base, templates, and cross-platform utilities li
 
 | Folder | What it is |
 |---|---|
-| [stratusphere/](stratusphere/README.md) | Stratusphere UX in Azure: preflight, the Hub, Database and Collector appliances, Connector ID Key rollout, teardown. Bicep and PowerShell for Azure Cloud Shell |
-| [profileunity/](profileunity/bicep/main.bicep) | Subscription-scoped Bicep for the ProfileUnity and FlexApp tier (`rg-<base>-liquidware`, spoke peering, DNS links, Key Vault, `lwconfig` / `media` / `appattach` storage, Console VM) |
-| [scripts/](scripts/Deploy-LiquidwareTier.ps1) | `Deploy-LiquidwareTier.ps1`, the one entry point for the tier (ProfileUnity, FlexApp, Stratusphere) against a landing zone, plus `LiquidwareTier.psm1`, `Publish-LiquidwareMedia.ps1`, `Set-LiquidwareSecret.ps1`, and host Run Commands |
+| [stratusphere/](stratusphere/README.md) | Stratusphere UX in Azure: preflight, the Hub, Database and Collector appliances, Connector ID Key rollout, teardown. Bicep, Terraform, and PowerShell for Azure Cloud Shell |
+| [profileunity/](profileunity/bicep/main.bicep) | Subscription-scoped Bicep (`profileunity/bicep/`) and Terraform (`profileunity/terraform/`) for the ProfileUnity and FlexApp tier (`rg-<base>-liquidware`, spoke peering, DNS links, Key Vault, `lwconfig` / `media` / `appattach` storage, Console VM) |
+| [scripts/](scripts/Deploy-LiquidwareTier.ps1) | `Deploy-LiquidwareTier.ps1`, the one entry point for the tier (ProfileUnity, FlexApp, Stratusphere; `-Engine Bicep` or `-Engine Terraform`) against a landing zone, plus `LiquidwareTier.psm1`, `Publish-LiquidwareMedia.ps1`, `Set-LiquidwareSecret.ps1`, and host Run Commands |
 | [docs/spec.md](docs/spec.md) | The tier: which product owns what, identity and storage per path, security, cost, phases ([red-team](docs/redteam.md), [decision AL-0001](docs/decisions/AL-0001-optional-tier.md)) |
 | [docs/deploy-spec.md](docs/deploy-spec.md) | How the tier is deployed, end to end, by script ([red-team](docs/deploy-redteam.md), [decision AL-0002](docs/decisions/AL-0002-automated-deployment.md)) |
 | [docs/console.md](docs/console.md) | The ProfileUnity console's manual steps until its silent install is verified (V18) |

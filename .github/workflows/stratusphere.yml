@@ -46,6 +46,25 @@ jobs:
             az bicep build-params --file "$f" --stdout > /dev/null
           done
 
+  terraform:
+    name: Stratusphere Terraform fmt, validate + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '~1.9'
+
+      - name: Terraform fmt, validate, and test
+        working-directory: stratusphere/terraform
+        run: |
+          terraform fmt -check
+          terraform init -backend=false
+          terraform validate
+          terraform test
+
   scripts:
     name: Stratusphere script analysis + tests
     runs-on: ubuntu-latest

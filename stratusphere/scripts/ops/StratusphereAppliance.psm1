@@ -15,6 +15,78 @@ function Get-SsuxApplianceDefault {
   [pscustomobject]@{ Ip = $script:defaultIp; CollectorIps = $script:collectorIps }
 }
 
+function Get-SsuxResourceGroupName {
+  # Resource group name: rg-<prefix>-stratusphere by default, or rg-<prefix>-<env>-stratusphere
+  # when -Environment is set so Invoke-AvdSandboxDeadline (rg-<prefix>-<env>-*) matches it.
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [string] $NamePrefix,
+    [ValidateSet('', 'dev', 'test', 'prod')] [string] $Environment = ''
+  )
+  if ($Environment) { "rg-$NamePrefix-$Environment-stratusphere" } else { "rg-$NamePrefix-stratusphere" }
+}
+
+function Get-SsuxSandboxDeadlineConfig {
+  # Deterministic schedule names, UTC timestamps, blob paths, and tags for aa-avdlz-runs
+  # (Invoke-AvdSandboxDeadline in avdlz-runs-rg), matching avd-landing-zone conventions.
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [string] $SubscriptionId,
+    [Parameter(Mandatory)] [string] $NamePrefix,
+    [Parameter(Mandatory)] [ValidateSet('dev', 'test', 'prod')] [string] $Environment,
+    [string] $BatchId = '',
+    [ValidateRange(6, 1440)] [int] $ShutdownAfterMinutes = 120,
+    [ValidateRange(6, 1440)] [int] $TeardownAfterMinutes = 240,
+    [datetime] $NowUtc = [datetime]::UtcNow
+  )
+  $utc = $NowUtc.ToUniversalTime()
+  if (-not $BatchId) { $BatchId = "b{0:yyyyMMdd-HHmm}" -f $utc }
+  if ($BatchId -notmatch '^b[0-9]{8}-[0-9]{4}$') {
+    throw "BatchId '$BatchId' must match bYYYYMMDD-HHmm."
+  }
+  $subClean = $SubscriptionId.Trim().ToLowerInvariant()
+  $hashBytes = [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes("avdlz-runs:$subClean"))
+  $hashHex = ([System.BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()).Substring(0, 12)
+  $storageAccount = "avdlzruns$hashHex"
+
+  $shutMin = [Math]::Max($ShutdownAfterMinutes, 6)
+  $tearMin = [Math]::Max($TeardownAfterMinutes, 6)
+  $shutdownUtc = $utc.AddMinutes($shutMin).ToString('yyyy-MM-ddTHH:mm:00Z')
+  $teardownUtc = $utc.AddMinutes($tearMin).ToString('yyyy-MM-ddTHH:mm:00Z')
+  $yyyyMM = $utc.ToString('yyyy-MM')
+
+  $shutdownSchedule = "ssux-shutdown-$NamePrefix-$BatchId-G1"
+  $teardownSchedule = "ssux-teardown-$NamePrefix-$BatchId-G2"
+  $rgPrefix = "rg-$NamePrefix-$Environment-"
+  $rgName = Get-SsuxResourceGroupName -NamePrefix $NamePrefix -Environment $Environment
+
+  [pscustomobject]@{
+    SubscriptionId       = $subClean
+    AutomationAccount    = 'aa-avdlz-runs'
+    AutomationRg         = 'avdlz-runs-rg'
+    RunbookName          = 'Invoke-AvdSandboxDeadline'
+    StorageAccount       = $storageAccount
+    BatchId              = $BatchId
+    ResourceGroupName    = $rgName
+    ResourceGroupPrefix  = $rgPrefix
+    ShutdownUtc          = $shutdownUtc
+    TeardownUtc          = $teardownUtc
+    ShutdownScheduleName = $shutdownSchedule
+    TeardownScheduleName = $teardownSchedule
+    ShutdownResultsBlob  = "queue/$yyyyMM/$BatchId/results-G1.json"
+    TeardownResultsBlob  = "queue/$yyyyMM/$BatchId/results-G2.json"
+    Tags                 = @{
+      'avdlz-component'         = 'stratusphere-ux'
+      'avdlz-owner'             = 'sandbox'
+      'avdlz-purpose'           = 'assessment-lab'
+      'avdlz-shutdown-utc'      = $shutdownUtc
+      'avdlz-teardown-utc'      = $teardownUtc
+      'avdlz-shutdown-schedule' = $shutdownSchedule
+      'avdlz-teardown-schedule' = $teardownSchedule
+    }
+  }
+}
+
 function Get-SsuxApplianceSpec {
   # The appliances a role set means: one row per VM with its name and expected IP.
   [CmdletBinding()]
@@ -285,6 +357,47 @@ function Get-SsuxApplianceSummary {
   [pscustomobject]@{ Total = @($Result).Count; Failed = $failed; Result = $(if ($failed -gt 0) { 'FAIL' } else { 'PASS' }) }
 }
 
-Export-ModuleMember -Function Get-SsuxApplianceDefault, Get-SsuxApplianceSpec, Get-SsuxApplianceRole, Get-SsuxApplianceArgumentError,
+function Get-SsuxTerraformVariable {
+  # Non-sensitive variables for stratusphere/terraform/variables.tf, matching parameters/lab.bicepparam.
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [string] $NamePrefix,
+    [Parameter(Mandatory)] [string] $Location,
+    [Parameter(Mandatory)] $Target,
+    [Parameter(Mandatory)] [string] $KeyVaultReaderObjectId,
+    [string] $Environment = '',
+    [string] $ImageVersion = '',
+    [string] $HubVmSize = '',
+    [string] $AutoShutdownTime = '2000',
+    [string] $PeerVnetId = '',
+    [bool] $DeployBastion = $true,
+    $DeadlineConfig = $null
+  )
+  $tags = @{ environment = $(if ($Environment) { $Environment } else { 'lab' }) }
+  if ($DeadlineConfig -and $DeadlineConfig.PSObject.Properties['Tags']) {
+    foreach ($k in $DeadlineConfig.Tags.Keys) { $tags[$k] = $DeadlineConfig.Tags[$k] }
+  }
+  [ordered]@{
+    namePrefix                   = $NamePrefix
+    environment                  = $Environment
+    location                     = $Location
+    tags                         = $tags
+    imageVersion                 = $(if ($ImageVersion) { $ImageVersion } else { 'latest' })
+    deployHub                    = [bool]$Target.DeployHub
+    hubImagePlan                 = $(if ($Target.Plan['Hub']) { [string]$Target.Plan['Hub'] } else { 'set-SSUX_HUB_PLAN' })
+    hubVmSize                    = $(if ($HubVmSize) { $HubVmSize } else { 'Standard_D4s_v5' })
+    deployDatabase               = [bool]$Target.DeployDatabase
+    databaseImagePlan            = [string]$Target.Plan['Database']
+    collectorCount               = [int]$Target.CollectorCount
+    collectorImagePlan           = [string]$Target.Plan['Collector']
+    autoShutdownTime             = $(if ($AutoShutdownTime) { $AutoShutdownTime } else { '2000' })
+    peerVirtualNetworkResourceId = $PeerVnetId
+    deployBastion                = $DeployBastion
+    keyVaultReaderObjectId       = $KeyVaultReaderObjectId
+  }
+}
+
+Export-ModuleMember -Function Get-SsuxApplianceDefault, Get-SsuxResourceGroupName, Get-SsuxSandboxDeadlineConfig,
+Get-SsuxApplianceSpec, Get-SsuxApplianceRole, Get-SsuxApplianceArgumentError,
 Get-SsuxDeployTarget, Get-SsuxApplianceHealth, Get-SsuxNetworkHealth, Get-SsuxVaultHealth, Get-SsuxTermsHealth,
-Get-SsuxFixPlan, Get-SsuxCleanupPlan, Get-SsuxRandomPassword, Get-SsuxApplianceSummary
+Get-SsuxFixPlan, Get-SsuxCleanupPlan, Get-SsuxRandomPassword, Get-SsuxApplianceSummary, Get-SsuxTerraformVariable

@@ -126,7 +126,9 @@ Describe 'Install-ProfileUnityConsole.ps1, run end to end with the network mocke
   }
   It 'deletes a download whose hash does not match' {
     $dest = Join-Path $TestDrive 'bad'
-    $out = pwsh -NoProfile -Command "& { function Invoke-RestMethod { [pscustomobject]@{ access_token = 't' } }; function Invoke-WebRequest { param(`$Uri, `$Headers, `$OutFile, [switch] `$UseBasicParsing) [System.IO.File]::WriteAllBytes(`$OutFile, [byte[]] (9, 9, 9)) }; & '$($script:script)' -MediaAccountName stabc -Blob 'ProfileUnityConsole/6.9.5/console.exe' -Sha256 '$($script:sha)' -Destination '$dest'; exit `$LASTEXITCODE }"
+    Mock Invoke-RestMethod { [pscustomobject]@{ access_token = 't' } }
+    Mock Invoke-WebRequest { [System.IO.File]::WriteAllBytes($OutFile, [byte[]] (9, 9, 9)) }
+    $out = & $script:script -MediaAccountName stabc -Blob 'ProfileUnityConsole/6.9.5/console.exe' -Sha256 $script:sha -Destination $dest
     $LASTEXITCODE | Should -Be 1
     ($out | Where-Object { $_ -like 'LW-RESULT*' }) | Should -Match 'status=failed.*mismatch'
     @(Get-ChildItem $dest -ErrorAction SilentlyContinue) | Should -BeNullOrEmpty

@@ -89,6 +89,29 @@ Describe 'Get-LwLandingZone' {
     $lz = Get-DevLandingZone -Change { param($f) $f.Resource = @($f.Resource | Where-Object ResourceType -ne 'Microsoft.Network/privateDnsZones') }
     $lz.ConnectivityMode | Should -Be 'HubPeered'
   }
+  It 'calls a landing zone with a route table on snet-session-hosts HubPeered even when local privatelink zones exist' {
+    $lz = Get-DevLandingZone -Change {
+      param($f)
+      $sub = @($f.Vnet.Subnets | Where-Object Name -eq 'snet-session-hosts')[0]
+      $sub | Add-Member -NotePropertyName RouteTableId -NotePropertyValue '/subscriptions/0/resourceGroups/rg-avdlz-dev-network/providers/Microsoft.Network/routeTables/rt-vnet-avdlz-dev-hosts'
+    }
+    $lz.ConnectivityMode | Should -Be 'HubPeered'
+  }
+  It 'discovers the automation account and falls back to custom topology host pools' {
+    $lz = Get-DevLandingZone -Change {
+      param($f)
+      foreach ($r in $f.Resource) {
+        if ($r.ResourceType -eq 'Microsoft.DesktopVirtualization/hostPools') {
+          $r.Name = 'vdpool-avdlz-dev-primary'
+          $r.ResourceId = $r.ResourceId -replace 'vdpool-avdlz-dev$', 'vdpool-avdlz-dev-primary'
+        }
+      }
+    }
+    @($lz.Missing).Count | Should -Be 0
+    $lz.AutomationAccountId | Should -Match '/automationAccounts/aa-avdlz-dev$'
+    $lz.HostPoolId | Should -Match '/hostPools/vdpool-avdlz-dev-primary$'
+    @($lz.HostPools).Count | Should -Be 1
+  }
 }
 
 Describe 'Get-LwLandingZoneCheck' {

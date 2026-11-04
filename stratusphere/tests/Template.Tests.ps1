@@ -74,6 +74,12 @@ Describe 'Roles' {
     $script:main | Should -Match ([regex]::Escape("'vm-`${namePrefix}-col`${i + 1}'"))
     (Get-Content (Join-Path $script:root 'bicep/modules/appliance.bicep') -Raw) | Should -Match ([regex]::Escape("'stratusphere-role': role"))
   }
+  It 'configures a daily Microsoft.DevTestLab/schedules shutdown task on each appliance VM' {
+    $app = Get-Content (Join-Path $script:root 'bicep/modules/appliance.bicep') -Raw
+    $app | Should -Match "resource autoShutdown 'Microsoft\.DevTestLab/schedules@2018-09-15'"
+    $app | Should -Match "name: 'shutdown-computevm-\$\{name\}'"
+    $app | Should -Match "taskType: 'ComputeVmShutdownTask'"
+  }
 }
 
 Describe 'Parameter file' {
@@ -86,6 +92,22 @@ Describe 'Parameter file' {
     $p = ((Get-Compiled).parametersJson | ConvertFrom-Json).parameters
     $p.location.value | Should -Be 'eastus2'
     $p.hubVmSize.value | Should -Be 'Standard_D4s_v5'
+  }
+  It 'stamps deadline tags and environment when SSUX_ENVIRONMENT and SSUX_SHUTDOWN_UTC are set' {
+    $env:SSUX_ENVIRONMENT = 'dev'
+    $env:SSUX_SHUTDOWN_UTC = '2026-11-03T20:00:00Z'
+    $env:SSUX_TEARDOWN_UTC = '2026-11-03T22:00:00Z'
+    $env:SSUX_SHUTDOWN_SCHEDULE = 'ssux-shutdown-ssux-b20261103-1800-G1'
+    $env:SSUX_TEARDOWN_SCHEDULE = 'ssux-teardown-ssux-b20261103-1800-G2'
+    try { $p = ((Get-Compiled).parametersJson | ConvertFrom-Json).parameters }
+    finally {
+      $env:SSUX_ENVIRONMENT = ''; $env:SSUX_SHUTDOWN_UTC = ''; $env:SSUX_TEARDOWN_UTC = ''
+      $env:SSUX_SHUTDOWN_SCHEDULE = ''; $env:SSUX_TEARDOWN_SCHEDULE = ''
+    }
+    $p.environment.value | Should -Be 'dev'
+    $p.tags.value.'avdlz-component' | Should -Be 'stratusphere-ux'
+    $p.tags.value.'avdlz-shutdown-schedule' | Should -Be 'ssux-shutdown-ssux-b20261103-1800-G1'
+    $p.tags.value.'avdlz-teardown-schedule' | Should -Be 'ssux-teardown-ssux-b20261103-1800-G2'
   }
 }
 
@@ -102,6 +124,11 @@ Describe 'Hub network exposure' {
     $net = Get-Content (Join-Path $script:root 'bicep/modules/network.bicep') -Raw
     $net | Should -Match "(?s)allowPostgres\s*\?\s*\[.*?Allow-Postgres-Between-Appliances.*?sourceAddressPrefix: hubSubnetPrefix.*?destinationAddressPrefix: hubSubnetPrefix.*?destinationPortRange: '5432'"
     $script:main | Should -Match 'allowPostgres: deployDatabase \|\| collectorCount > 0'
+  }
+  It 'uses singular sourceAddressPrefix when callbackSourcePrefixes has one entry so VirtualNetwork service tag passes ARM preflight' {
+    $net = Get-Content (Join-Path $script:root 'bicep/modules/network.bicep') -Raw
+    $net | Should -Match 'sourceAddressPrefix: length\(callbackSourcePrefixes\) == 1 \? callbackSourcePrefixes\[0\] : null'
+    $net | Should -Match 'sourceAddressPrefixes: length\(callbackSourcePrefixes\) > 1 \? callbackSourcePrefixes : null'
   }
 }
 
@@ -125,6 +152,8 @@ Describe 'Disclaimer' {
       'scripts/ops/StratusphereReadiness.psm1'
       'scripts/ops/StratusphereAppliance.psm1'
       'scripts/ops/Deploy-Stratusphere.ps1'
+      'scripts/ops/New-SandboxStratusphere.ps1'
+      'scripts/ops/Remove-SandboxStratusphere.ps1'
       'scripts/ops/CidKeyRollout.psm1'
       'scripts/ops/Deploy-CidKey.ps1'
       'scripts/agent/Invoke-CidKeyAction.ps1'

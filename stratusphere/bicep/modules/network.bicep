@@ -55,7 +55,9 @@ module hubNsg 'br/public:avm/res/network/network-security-group:0.5.3' = {
             direction: 'Inbound'
             access: 'Allow'
             protocol: 'Tcp'
-            sourceAddressPrefixes: callbackSourcePrefixes
+            // Azure rejects service tags like 'VirtualNetwork' in plural sourceAddressPrefixes.
+            sourceAddressPrefix: length(callbackSourcePrefixes) == 1 ? callbackSourcePrefixes[0] : null
+            sourceAddressPrefixes: length(callbackSourcePrefixes) > 1 ? callbackSourcePrefixes : null
             sourcePortRange: '*'
             destinationAddressPrefix: hubSubnetPrefix
             destinationPortRange: '443'

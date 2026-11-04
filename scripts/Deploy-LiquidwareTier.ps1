@@ -50,7 +50,8 @@ param(
   [switch] $ApplicationRestrictions,
   [switch] $Packaging,
   [ValidateSet('QA', 'All')] [string] $Ring = 'QA',
-  [string] $WindowEnd = ''
+  [string] $WindowEnd = '',
+  [ValidateSet('Bicep', 'Terraform')] [string] $Engine = 'Bicep'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -131,7 +132,14 @@ if ($az) {
     Id              = $az.Id
     Location        = $az.Location
     AddressPrefixes = @($az.AddressSpace.AddressPrefixes)
-    Subnets         = @($az.Subnets | ForEach-Object { [pscustomobject]@{ Name = $_.Name; AddressPrefix = @($_.AddressPrefix)[0] } })
+    Subnets         = @($az.Subnets | ForEach-Object {
+        [pscustomobject]@{
+          Name          = $_.Name
+          AddressPrefix = @($_.AddressPrefix)[0]
+          NatGatewayId  = $(if ($_.NatGateway) { $_.NatGateway.Id } else { $null })
+          RouteTableId  = $(if ($_.RouteTable) { $_.RouteTable.Id } else { $null })
+        }
+      })
     Peerings        = @($az.VirtualNetworkPeerings | Where-Object { $_ } | ForEach-Object {
         [pscustomobject]@{ Name = $_.Name; RemoteVnetId = $_.RemoteVirtualNetwork.Id; RemoteAddressPrefixes = @($_.RemoteVirtualNetworkAddressSpace.AddressPrefixes) }
       })
@@ -253,32 +261,91 @@ if ($profileUnity -and $Action -in 'Plan', 'Deploy' -and @($results | Where-Obje
       elseif ($null -eq $v) { $v = '' }
       $templateParams[$k] = $v
     }
-    Write-Host 'Running what-if on profileunity/bicep/main.bicep (read-only) ...'
-    $whatIf = Get-AzSubscriptionDeploymentWhatIfResult -Name "liquidware-$($names.Base)" -Location $lz.Location `
-      -TemplateFile (Join-Path $PSScriptRoot '../profileunity/bicep/main.bicep') -TemplateParameterObject $templateParams
-    $changes = @($whatIf.Changes | ForEach-Object { [pscustomobject]@{ ChangeType = "$($_.ChangeType)"; ResourceId = $_.FullyQualifiedResourceId } })
-    Add-Result (Get-LwWhatIfSummary -Change $changes -LandingZone $lz)
-
     $deployment = $null
-    if ($Action -eq 'Deploy' -and @($results | Where-Object Status -eq 'FAIL').Count -eq 0 -and
-      (Confirm-Step -Target $names.TierGroup -What 'Deploy the changes above' -Force:$Force)) {
-      if ($deleted.Vault) {
-        if ($groups -notcontains $names.TierGroup) { $null = New-AzResourceGroup -Name $names.TierGroup -Location $lz.Location }
-        Write-Host "Recovering $($deleted.Vault.VaultName) ..."
-        $null = Undo-AzKeyVaultRemoval -VaultName $deleted.Vault.VaultName -ResourceGroupName $names.TierGroup -Location $deleted.Vault.Location
+    $mediaAccountOut = ''
+    if ($Engine -eq 'Terraform') {
+      if (-not (Get-Command terraform -ErrorAction SilentlyContinue)) {
+        Add-Result (Get-LwCheckResult FAIL 'terraform-cli' 'The Terraform CLI is not on PATH.' -Recommendation 'Install Terraform (>= 1.9) or use -Engine Bicep.' -Category ProfileUnity)
       }
-      Write-Host 'Deploying profileunity/bicep/main.bicep (several minutes) ...'
-      $deployment = $null
-      try {
-        $deployment = New-AzSubscriptionDeployment -Name "liquidware-$($names.Base)" -Location $lz.Location `
-          -TemplateFile (Join-Path $PSScriptRoot '../profileunity/bicep/main.bicep') -TemplateParameterObject $templateParams
+      else {
+        $tfDir = Join-Path $PSScriptRoot '../profileunity/terraform'
+        $tfVars = @{}
+        foreach ($k in $templateParams.Keys) {
+          if ($k -in 'consoleAdminPassword', 'packagingAdminPassword') { continue }
+          $tfVars[$k] = $templateParams[$k]
+        }
+        $varFile = Join-Path ([System.IO.Path]::GetTempPath()) "lw-tf-$PID.tfvars.json"
+        $tfVars | ConvertTo-Json -Depth 5 | Set-Content -Path $varFile -Encoding utf8NoBOM -WhatIf:$false
+        try {
+          $env:TF_VAR_consoleAdminPassword = [string]$templateParams['consoleAdminPassword']
+          $env:TF_VAR_packagingAdminPassword = [string]$templateParams['packagingAdminPassword']
+          Write-Host 'Running terraform init and plan on profileunity/terraform (read-only) ...'
+          & terraform "-chdir=$tfDir" init -input=false | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Add-Result (Get-LwCheckResult FAIL 'terraform-init' 'terraform init failed in profileunity/terraform.' -Recommendation 'Check network access to registry.terraform.io.' -Category 'Plan')
+          }
+          else {
+            & terraform "-chdir=$tfDir" plan -input=false "-var-file=$varFile"
+            if ($LASTEXITCODE -ne 0) {
+              Add-Result (Get-LwCheckResult FAIL 'terraform-plan' 'terraform plan failed on profileunity/terraform.' -Recommendation 'Review the Terraform plan output above.' -Category 'Plan')
+            }
+            else {
+              Add-Result (Get-LwCheckResult INFO 'terraform-plan' 'terraform plan succeeded on profileunity/terraform.' -Category 'Plan')
+            }
+          }
+          if ($Action -eq 'Deploy' -and @($results | Where-Object Status -eq 'FAIL').Count -eq 0 -and
+            (Confirm-Step -Target $names.TierGroup -What 'Deploy the changes above (Terraform)' -Force:$Force)) {
+            if ($deleted.Vault) {
+              if ($groups -notcontains $names.TierGroup) { $null = New-AzResourceGroup -Name $names.TierGroup -Location $lz.Location }
+              Write-Host "Recovering $($deleted.Vault.VaultName) ..."
+              $null = Undo-AzKeyVaultRemoval -VaultName $deleted.Vault.VaultName -ResourceGroupName $names.TierGroup -Location $deleted.Vault.Location
+            }
+            Write-Host 'Applying profileunity/terraform (several minutes) ...'
+            & terraform "-chdir=$tfDir" apply -auto-approve -input=false "-var-file=$varFile"
+            if ($LASTEXITCODE -eq 0) {
+              $deployment = [pscustomobject]@{ ProvisioningState = 'Succeeded' }
+              $mediaAccountOut = (& terraform "-chdir=$tfDir" output -raw mediaAccountName 2>$null)
+              Add-Result (Get-LwCheckResult PASS 'deploy' "liquidware-$($names.Base) (Terraform) succeeded." -Category ProfileUnity)
+            }
+            else {
+              Add-Result (Get-LwCheckResult FAIL 'deploy' "liquidware-$($names.Base) (Terraform) failed." -Recommendation 'Review the Terraform apply output above, fix, then Deploy again.' -Category ProfileUnity)
+            }
+          }
+        }
+        finally {
+          Remove-Item "env:TF_VAR_consoleAdminPassword" -ErrorAction SilentlyContinue
+          Remove-Item "env:TF_VAR_packagingAdminPassword" -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $varFile -Force -ErrorAction SilentlyContinue
+        }
       }
-      catch { Add-Result (Get-LwCheckResult FAIL 'deploy' $_.Exception.Message -Recommendation 'Read the deployment in the portal (subscription, Deployments), fix, then Deploy again.' -Category ProfileUnity) }
-      if ($deployment -and $deployment.ProvisioningState -eq 'Succeeded') {
-        Add-Result (Get-LwCheckResult PASS 'deploy' "liquidware-$($names.Base) succeeded." -Category ProfileUnity)
-      }
-      elseif ($deployment) {
-        Add-Result (Get-LwCheckResult FAIL 'deploy' "liquidware-$($names.Base) ended $($deployment.ProvisioningState)." -Recommendation 'Read the deployment in the portal, fix, then Deploy again.' -Category ProfileUnity)
+    }
+    else {
+      Write-Host 'Running what-if on profileunity/bicep/main.bicep (read-only) ...'
+      $whatIf = Get-AzSubscriptionDeploymentWhatIfResult -Name "liquidware-$($names.Base)" -Location $lz.Location `
+        -TemplateFile (Join-Path $PSScriptRoot '../profileunity/bicep/main.bicep') -TemplateParameterObject $templateParams
+      $changes = @($whatIf.Changes | ForEach-Object { [pscustomobject]@{ ChangeType = "$($_.ChangeType)"; ResourceId = $_.FullyQualifiedResourceId } })
+      Add-Result (Get-LwWhatIfSummary -Change $changes -LandingZone $lz)
+
+      if ($Action -eq 'Deploy' -and @($results | Where-Object Status -eq 'FAIL').Count -eq 0 -and
+        (Confirm-Step -Target $names.TierGroup -What 'Deploy the changes above' -Force:$Force)) {
+        if ($deleted.Vault) {
+          if ($groups -notcontains $names.TierGroup) { $null = New-AzResourceGroup -Name $names.TierGroup -Location $lz.Location }
+          Write-Host "Recovering $($deleted.Vault.VaultName) ..."
+          $null = Undo-AzKeyVaultRemoval -VaultName $deleted.Vault.VaultName -ResourceGroupName $names.TierGroup -Location $deleted.Vault.Location
+        }
+        Write-Host 'Deploying profileunity/bicep/main.bicep (several minutes) ...'
+        try {
+          $deployment = New-AzSubscriptionDeployment -Name "liquidware-$($names.Base)" -Location $lz.Location `
+            -TemplateFile (Join-Path $PSScriptRoot '../profileunity/bicep/main.bicep') -TemplateParameterObject $templateParams
+        }
+        catch { Add-Result (Get-LwCheckResult FAIL 'deploy' $_.Exception.Message -Recommendation 'Read the deployment in the portal (subscription, Deployments), fix, then Deploy again.' -Category ProfileUnity) }
+        if ($deployment -and $deployment.ProvisioningState -eq 'Succeeded') {
+          $mediaAccountOut = $deployment.Outputs['mediaAccountName'].Value
+          Add-Result (Get-LwCheckResult PASS 'deploy' "liquidware-$($names.Base) succeeded." -Category ProfileUnity)
+        }
+        elseif ($deployment) {
+          Add-Result (Get-LwCheckResult FAIL 'deploy' "liquidware-$($names.Base) ended $($deployment.ProvisioningState)." -Recommendation 'Read the deployment in the portal, fix, then Deploy again.' -Category ProfileUnity)
+        }
       }
     }
     $templateParams.Remove('consoleAdminPassword')
@@ -303,7 +370,7 @@ if ($profileUnity -and $Action -in 'Plan', 'Deploy' -and @($results | Where-Obje
         $rcArgs = @{ ResourceGroupName = $names.TierGroup; VMName = $names.ConsoleVm; RunCommandName = 'lw-profileunity-console' }
         try {
           $null = Set-AzVMRunCommand @rcArgs -Location $lz.Location -ScriptLocalPath (Join-Path $PSScriptRoot 'host/Install-ProfileUnityConsole.ps1') `
-            -Parameter @(@{ Name = 'MediaAccountName'; Value = $deployment.Outputs['mediaAccountName'].Value }, @{ Name = 'Blob'; Value = $entry.blob }, @{ Name = 'Sha256'; Value = $entry.sha256 })
+            -Parameter @(@{ Name = 'MediaAccountName'; Value = $mediaAccountOut }, @{ Name = 'Blob'; Value = $entry.blob }, @{ Name = 'Sha256'; Value = $entry.sha256 })
           $view = (Get-AzVMRunCommand @rcArgs -Expand InstanceView).InstanceView
           Add-Result (Get-LwRunCommandResult -Output "$($view.Output)`n$($view.Error)" -Check 'console-install')
         }

@@ -38,7 +38,7 @@ With direct peering, Azure adds a system route for the assessment VNet's `/24`. 
 
 - `-HostPoolName` and `-HostPoolResourceGroup`: the session hosts' subnets (from their NICs) and their count.
 - `-EndpointSubnetId`: any subnets, for desktops that aren't in a host pool.
-- `-AvdCurrentStatePath`: a package (folder or zip) from [avd-current-state](https://github.com/nickprignano/avd-current-state)'s collector. The preflight reads the session host count and every VNet's address space from it, so you can size and check overlaps against an estate you don't have live access to.
+- `-AvdCurrentStatePath`: a package (folder or zip) from [avd-current-state](https://github.com/avd-ops/avd-current-state)'s collector. The preflight reads the session host count and every VNet's address space from it, so you can size and check overlaps against an estate you don't have live access to.
 
 `-EndpointCount` overrides the count.
 

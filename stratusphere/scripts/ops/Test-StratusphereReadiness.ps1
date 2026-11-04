@@ -25,7 +25,7 @@
 
   Endpoints come from -EndpointSubnetId, from an AVD host pool (-HostPoolName, the session
   hosts' subnets and count), and from an avd-current-state collector package
-  (-AvdCurrentStatePath, github.com/nickprignano/avd-current-state: session host count and
+  (-AvdCurrentStatePath, github.com/avd-ops/avd-current-state: session host count and
   every VNet's address space).
 
   Everything it read is captured with the results in output/preflight-<time>/: report.md,
@@ -58,6 +58,7 @@ param(
   [string] $DatabaseVmSize = 'Standard_D4s_v5',
   [string] $CollectorVmSize = 'Standard_D2s_v5',
   [string] $NamePrefix = 'ssux',
+  [ValidateSet('', 'dev', 'test', 'prod')] [string] $Environment = '',
   [string] $AddressPrefix = '10.60.0.0/24',
   [string] $PeerVnetId = '',
   [string[]] $EndpointSubnetId = @(),
@@ -100,7 +101,7 @@ if ($Role -contains 'Collector') { $plans.Collector = $CollectorPlan }
 $sizes = @{ Hub = $HubVmSize; Database = $DatabaseVmSize; Collector = $CollectorVmSize }
 $counts = @{ Hub = 1; Database = 1; Collector = $CollectorCount }
 $hubIp = (Get-SsuxApplianceDefault).Ip.Hub
-$rgName = "rg-$NamePrefix-stratusphere"
+$rgName = Get-SsuxResourceGroupName -NamePrefix $NamePrefix -Environment $Environment
 
 $results = [System.Collections.Generic.List[object]]::new()
 $state = [ordered]@{ capturedAt = (Get-Date).ToUniversalTime().ToString('o') }
@@ -118,94 +119,104 @@ function Get-Prop($Object, [string[]] $Path) {
   # Az modules move properties between versions (Properties.X vs X); take the first that exists.
   foreach ($p in $Path) {
     $v = $Object
-    foreach ($part in $p -split '\.') { if ($null -eq $v) { break }; $v = $v.$part }
+    foreach ($part in ($p -split '\.')) {
+      if ($null -eq $v) { break }
+      $prop = $v.PSObject.Properties[$part]
+      $v = $(if ($prop) { $prop.Value } else { $null })
+    }
     if ($null -ne $v) { return $v }
   }
 }
 
 # ---------- Tooling ----------
 Write-Section 'Tooling'
-Add-Result (Get-SsuxCheckResult INFO 'powershell' "PowerShell $($PSVersionTable.PSVersion)$(if ($env:AZUREPS_HOST_ENVIRONMENT -like 'cloud-shell*') { ' in Azure Cloud Shell' })")
-foreach ($m in 'Az.Accounts', 'Az.Resources', 'Az.Compute', 'Az.Network', 'Az.KeyVault', 'Az.MarketplaceOrdering', 'Az.DesktopVirtualization') {
+Add-Result (Get-SsuxCheckResult INFO 'powershell' "PowerShell $($PSVersionTable.PSVersion)")
+$azModules = @('Az.Accounts', 'Az.Resources', 'Az.Compute', 'Az.Network', 'Az.KeyVault', 'Az.MarketplaceOrdering', 'Az.PrivateDns')
+if ($HostPoolName) { $azModules += 'Az.DesktopVirtualization' }
+foreach ($m in $azModules) {
   if (-not (Get-Module -ListAvailable -Name $m)) {
     Write-Host "  Installing $m from the PowerShell Gallery ..."
     Install-Module $m -Scope CurrentUser -Force -AllowClobber
   }
   Import-Module $m
 }
-$state.modules = @(Get-Module Az.* | Select-Object Name, @{ N = 'Version'; E = { "$($_.Version)" } })
-if (Get-Command bicep -ErrorAction SilentlyContinue) { Add-Result (Get-SsuxCheckResult PASS 'bicep' 'Bicep CLI on PATH') }
-elseif (Test-Path (Join-Path $HOME '.azure/bin/bicep')) { Add-Result (Get-SsuxCheckResult PASS 'bicep' 'Bicep CLI installed by az (Deploy-Stratusphere.ps1 adds it to PATH)') }
-elseif ($Fix -and (Get-Command az -ErrorAction SilentlyContinue) -and $PSCmdlet.ShouldProcess('Bicep CLI', 'az bicep install')) {
-  az bicep install | Out-Null
-  Add-Result (Get-SsuxCheckResult FIXED 'bicep' 'Installed the Bicep CLI with az bicep install')
+if (-not (Get-Command bicep -ErrorAction SilentlyContinue) -and (Test-Path (Join-Path $HOME '.azure/bin/bicep'))) {
+  $env:PATH = (Join-Path $HOME '.azure/bin') + [IO.Path]::PathSeparator + $env:PATH
 }
-else { Add-Result (Get-SsuxCheckResult FAIL 'bicep' 'No Bicep CLI; the deployment reads a .bicepparam file' -Recommendation 'Run with -Fix, or az bicep install.') }
+if (Get-Command bicep -ErrorAction SilentlyContinue) {
+  Add-Result (Get-SsuxCheckResult PASS 'bicep' 'Bicep CLI on PATH')
+}
+elseif ($Fix -and (Get-Command az -ErrorAction SilentlyContinue) -and $PSCmdlet.ShouldProcess('bicep', 'az bicep install')) {
+  az bicep install | Out-Null
+  $env:PATH = (Join-Path $HOME '.azure/bin') + [IO.Path]::PathSeparator + $env:PATH
+  Add-Result (Get-SsuxCheckResult FIXED 'bicep' 'Installed Bicep CLI via az bicep install')
+}
+else {
+  Add-Result (Get-SsuxCheckResult WARN 'bicep' 'Bicep CLI not on PATH (Deploy-Stratusphere.ps1 installs it automatically)' -Recommendation 'Run with -Fix, or: az bicep install')
+}
 
 # ---------- Identity ----------
 Write-Section 'Identity'
 $context = Get-AzContext
-if (-not $context) { Write-Host '  Not signed in. Run Connect-AzAccount (Cloud Shell is already signed in).'; Write-Host 'RESULT FAIL could not run'; exit 2 }
+if (-not $context) { Write-Host '  Not signed in. Run Connect-AzAccount.'; Write-Host 'RESULT FAIL could not run'; exit 2 }
 $sub = Get-AzSubscription -SubscriptionId $context.Subscription.Id
-$state.subscription = [ordered]@{ id = $sub.Id; name = $sub.Name; state = "$($sub.State)"; tenantId = $sub.TenantId; account = $context.Account.Id; accountType = "$($context.Account.Type)" }
-if ("$($sub.State)" -eq 'Enabled') { Add-Result (Get-SsuxCheckResult PASS 'subscription' "$($sub.Name) is enabled") }
-else { Add-Result (Get-SsuxCheckResult FAIL 'subscription' "$($sub.Name) is $($sub.State)" -Recommendation 'Use an enabled subscription.') }
+$state.subscription = [ordered]@{ id = $sub.Id; name = $sub.Name; state = $sub.State; tenantId = $sub.TenantId; account = $context.Account.Id }
+if ($sub.State -eq 'Enabled') { Add-Result (Get-SsuxCheckResult PASS 'subscription' "$($sub.Name) is enabled") }
+else { Add-Result (Get-SsuxCheckResult FAIL 'subscription' "$($sub.Name) is $($sub.State)" -Recommendation 'Switch to an enabled subscription with Set-AzContext.') }
 
-$roleNames = @(); $couldRead = $true
 try {
-  $me = $(if ("$($context.Account.Type)" -eq 'ServicePrincipal') { (Get-AzADServicePrincipal -ApplicationId $context.Account.Id).Id } else { (Get-AzADUser -SignedIn).Id })
-  $subScope = "/subscriptions/$($sub.Id)"
-  $assignments = @(Get-AzRoleAssignment -ObjectId $me -ExpandPrincipalGroups | Where-Object {
-      $_.Scope -eq '/' -or $_.Scope -eq $subScope -or $_.Scope -like '/providers/Microsoft.Management/managementGroups/*' })
-  $roleNames = @($assignments | ForEach-Object RoleDefinitionName | Sort-Object -Unique)
-  $state.roleAssignments = @($assignments | Select-Object RoleDefinitionName, Scope)
+  $roles = @(Get-AzRoleAssignment -SignInName $context.Account.Id -Scope "/subscriptions/$($sub.Id)" -ErrorAction Stop | ForEach-Object RoleDefinitionName | Sort-Object -Unique)
+  $state.roles = $roles
+  Add-Result (Get-SsuxRoleCheck -Role $roles)
 }
-catch { $couldRead = $false; Write-Verbose $_.Exception.Message }
-Add-Result (Get-SsuxRoleCoverageCheck -RoleName $roleNames -CouldRead $couldRead)
+catch { Add-Result (Get-SsuxCheckResult SKIP 'deploy-role' "Could not read role assignments ($($_.Exception.Message))" -Recommendation 'Owner, or Contributor plus User Access Administrator, is needed.') }
 
 # ---------- Providers ----------
 Write-Section 'Providers'
-$state.providers = [ordered]@{}
 foreach ($ns in 'Microsoft.Compute', 'Microsoft.Network', 'Microsoft.KeyVault', 'Microsoft.MarketplaceOrdering') {
-  $reg = (Get-AzResourceProvider -ProviderNamespace $ns | Select-Object -First 1).RegistrationState
-  $state.providers[$ns] = "$reg"
-  if ($reg -eq 'Registered') { Add-Result (Get-SsuxCheckResult PASS 'provider' "$ns registered"); continue }
-  if ($Fix -and $PSCmdlet.ShouldProcess($ns, 'Register resource provider')) {
+  $st = (Get-AzResourceProvider -ProviderNamespace $ns | Select-Object -First 1).RegistrationState
+  if ($st -eq 'Registered') { Add-Result (Get-SsuxCheckResult PASS 'provider' "$ns registered") }
+  elseif ($Fix -and $PSCmdlet.ShouldProcess($ns, 'Register resource provider')) {
     Register-AzResourceProvider -ProviderNamespace $ns | Out-Null
-    Add-Result (Get-SsuxCheckResult FIXED 'provider' "$ns registration started (it can take a few minutes)")
+    Add-Result (Get-SsuxCheckResult FIXED 'provider' "$ns registration started")
   }
-  else { Add-Result (Get-SsuxCheckResult FAIL 'provider' "$ns is $reg" -Recommendation 'Run with -Fix.') }
+  else { Add-Result (Get-SsuxCheckResult FAIL 'provider' "$ns is $st" -Recommendation "Run with -Fix, or: Register-AzResourceProvider -ProviderNamespace $ns") }
 }
 
-# ---------- Region and Marketplace ----------
+# ---------- Marketplace ----------
 Write-Section 'Marketplace'
-$regions = @(Get-AzLocation | ForEach-Object Location)
-if ($regions -notcontains $Location) {
-  Add-Result (Get-SsuxCheckResult FAIL 'region' "'$Location' is not a region this subscription can use" -Recommendation "Use one of: $(($regions | Sort-Object) -join ', ')")
-}
 $offered = @()
 try { $offered = @(Get-AzVMImageSku -Location $Location -PublisherName $Publisher -Offer $Offer | ForEach-Object Skus) }
-catch { Write-Host "  Get-AzVMImageSku: $($_.Exception.Message)" }
-$state.marketplace = [ordered]@{ publisher = $Publisher; offer = $Offer; plansOffered = $offered; plans = [ordered]@{} }
+catch { Add-Result (Get-SsuxCheckResult WARN 'marketplace-skus' "Could not list plans for $Publisher/$Offer in ${Location}: $($_.Exception.Message)") }
+$state.marketplace = [ordered]@{ publisher = $Publisher; offer = $Offer; offeredPlans = $offered; roles = [ordered]@{} }
+
 foreach ($r in $plans.Keys) {
-  $p = $plans[$r]
   Write-Host "  $r"
-  $planResult = Get-SsuxPlanCheck -AvailablePlans $offered -Plan $p -Location $Location
-  $planResult.Check = "plan $($r.ToLower())"
-  Add-Result $planResult
-  if ($planResult.Status -ne 'PASS') { continue }
-  $versions = @(Get-AzVMImage -Location $Location -PublisherName $Publisher -Offer $Offer -Skus $p)
-  $latest = ($versions | Sort-Object { [version]($_.Version -replace '[^0-9.]', '') } | Select-Object -Last 1).Version
-  $image = Get-AzVMImage -Location $Location -PublisherName $Publisher -Offer $Offer -Skus $p -Version $latest
-  Add-Result (Get-SsuxImagePlanCheck -PurchasePlan $image.PurchasePlan -Version $latest)
-  $terms = Get-AzMarketplaceTerms -Publisher $Publisher -Product $Offer -Name $p -OfferType 'virtualmachine'
-  $state.marketplace.plans[$p] = [ordered]@{ role = $r; latestVersion = $latest; termsAccepted = [bool]$terms.Accepted }
-  if ($terms.Accepted) { Add-Result (Get-SsuxCheckResult PASS 'marketplace-terms' "Accepted for $p") }
-  elseif ($Fix -and $PSCmdlet.ShouldProcess($p, 'Accept Marketplace terms')) {
-    Set-AzMarketplaceTerms -Publisher $Publisher -Product $Offer -Name $p -Terms $terms -Accept | Out-Null
-    Add-Result (Get-SsuxCheckResult FIXED 'marketplace-terms' "Accepted for $p")
+  $plan = $plans[$r]
+  $planCheck = Get-SsuxPlanCheck -AvailablePlans $offered -Plan $plan -Location $Location -Check "plan $($r.ToLower())"
+  Add-Result $planCheck
+  if ($planCheck.Status -ne 'PASS') { continue }
+
+  try {
+    $ver = @(Get-AzVMImage -Location $Location -PublisherName $Publisher -Offer $Offer -Skus $plan | Sort-Object Version -Descending | Select-Object -First 1)
+    if (-not $ver) { Add-Result (Get-SsuxCheckResult FAIL "image $($r.ToLower())" "No image versions under plan '$plan' in $Location"); continue }
+    $detail = Get-AzVMImage -Location $Location -PublisherName $Publisher -Offer $Offer -Skus $plan -Version $ver[0].Version
+    $pp = Get-Prop $detail 'PurchasePlan.Name', 'Plan.Name'
+    Add-Result (Get-SsuxImagePlanCheck -Plan $plan -Version $ver[0].Version -PurchasePlanName "$pp")
+    $state.marketplace.roles[$r] = [ordered]@{ plan = $plan; latestVersion = $ver[0].Version; purchasePlan = "$pp" }
   }
-  else { Add-Result (Get-SsuxCheckResult FAIL 'marketplace-terms' "Not accepted for $p" -Recommendation 'Run with -Fix; Deploy-Stratusphere.ps1 also accepts them.') }
+  catch { Add-Result (Get-SsuxCheckResult WARN "image $($r.ToLower())" "Could not inspect image for '$plan': $($_.Exception.Message)") }
+
+  try {
+    $terms = Get-AzMarketplaceTerms -Publisher $Publisher -Product $Offer -Name $plan -OfferType 'virtualmachine'
+    if ($terms.Accepted) { Add-Result (Get-SsuxCheckResult PASS 'marketplace-terms' "Accepted for $plan") }
+    elseif ($Fix -and $PSCmdlet.ShouldProcess("$Publisher/$Offer/$plan", 'Accept Marketplace terms')) {
+      Set-AzMarketplaceTerms -Publisher $Publisher -Product $Offer -Name $plan -Terms $terms -Accept | Out-Null
+      Add-Result (Get-SsuxCheckResult FIXED 'marketplace-terms' "Accepted for $plan")
+    }
+    else { Add-Result (Get-SsuxCheckResult FAIL 'marketplace-terms' "Not accepted for $plan" -Recommendation 'Run with -Fix; Deploy-Stratusphere.ps1 also accepts them.') }
+  }
+  catch { Add-Result (Get-SsuxCheckResult WARN 'marketplace-terms' "Could not check terms for '$plan': $($_.Exception.Message)") }
 }
 
 # ---------- Capacity ----------
@@ -213,30 +224,29 @@ Write-Section 'Capacity'
 $skus = @(Get-AzComputeResourceSku -Location $Location | Where-Object ResourceType -eq 'virtualMachines')
 $need = @()
 foreach ($r in $plans.Keys) {
-  $sku = $skus | Where-Object Name -eq $sizes[$r] | Select-Object -First 1
-  $sizeResult = Get-SsuxVmSizeCheck -Sku $sku -VmSize $sizes[$r] -Location $Location
-  $sizeResult.Check = "vm-size $($r.ToLower())"
-  Add-Result $sizeResult
-  if ($sizeResult.Status -ne 'PASS') { continue }
-  $vcpus = [int](($sku.Capabilities | Where-Object Name -eq 'vCPUs').Value)
-  $need += [pscustomobject]@{ Role = $r; Family = $sku.Family; VCpus = $vcpus * $counts[$r]; Size = $sizes[$r] }
+  $size = $sizes[$r]
+  $hit = $skus | Where-Object Name -eq $size | Select-Object -First 1
+  $zones = @(); $rest = @(); $vcpus = 4; $family = ''
+  if ($hit) {
+    $zones = @($hit.LocationInfo | ForEach-Object Zones | Where-Object { $_ })
+    $rest = @($hit.Restrictions | ForEach-Object { if ($_.Type) { "$($_.Type) ($($_.ReasonCode))" } else { "$($_.ReasonCode)" } })
+    $family = $hit.Family
+    $cap = $hit.Capabilities | Where-Object Name -eq 'vCPUs' | Select-Object -First 1
+    if ($cap) { $vcpus = [int]$cap.Value }
+  }
+  Add-Result (Get-SsuxSkuCheck -VmSize $size -Found ([bool]$hit) -Restriction $rest -Zone $zones -Location $Location -Check "vm-size $($r.ToLower())")
+  for ($i = 0; $i -lt $counts[$r]; $i++) { $need += [pscustomobject]@{ Role = $r; Size = $size; Family = $family; Vcpus = $vcpus } }
 }
-$vmUsage = @(Get-AzVMUsage -Location $Location)
-$netUsage = @(Get-AzNetworkUsage -Location $Location)
-if ($need.Count) { Add-Result (Get-SsuxQuotaCheck -Need $need -Usage $vmUsage) }
-$applianceCount = ($plans.Keys | ForEach-Object { $counts[$_] } | Measure-Object -Sum).Sum
-Add-Result (Get-SsuxNetworkQuotaCheck -Nics $applianceCount -PublicIps $(if ($NoBastion) { 1 } else { 2 }) -Usage $netUsage)
-$families = @($need | ForEach-Object Family) + 'cores'
-$state.capacity = [ordered]@{
-  need         = $need
-  vmUsage      = @($vmUsage | Where-Object { $families -contains $_.Name.Value } | Select-Object @{ N = 'Name'; E = { $_.Name.Value } }, CurrentValue, Limit)
-  networkUsage = @($netUsage | Where-Object { $_.Name.Value -in 'NetworkInterfaces', 'PublicIPAddresses', 'VirtualNetworks' } | Select-Object @{ N = 'Name'; E = { $_.Name.Value } }, CurrentValue, Limit)
+$usage = @(Get-AzVMUsage -Location $Location) + @(Get-AzNetworkUsage -Location $Location) | ForEach-Object {
+  [pscustomobject]@{ Name = "$(Get-Prop $_ 'Name.Value', 'ResourceType')"; Localized = "$(Get-Prop $_ 'Name.LocalizedValue', 'Name')"; Current = [int]$_.CurrentValue; Limit = [int]$_.Limit }
 }
+$state.usage = $usage
+Add-Result (Get-SsuxQuotaCheck -Appliance $need -Usage $usage -DeployBastion:(-not $NoBastion))
 
 # ---------- Policy ----------
 Write-Section 'Policy'
-$rows = @()
 try {
+  $rows = @()
   $assignments = @(Get-AzPolicyAssignment -Scope "/subscriptions/$($sub.Id)")
   $inspected = 0
   foreach ($a in $assignments) {
@@ -401,7 +411,7 @@ $results | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $dir 'results.json')
 $results | Export-Csv (Join-Path $dir 'results.csv') -NoTypeInformation
 $state | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $dir 'current-state.json')
 $inputs = [ordered]@{}
-foreach ($k in 'Location', 'Role', 'HubPlan', 'DatabasePlan', 'CollectorPlan', 'CollectorCount', 'HubVmSize', 'DatabaseVmSize', 'CollectorVmSize', 'NamePrefix', 'AddressPrefix', 'PeerVnetId', 'EndpointSubnetId', 'HostPoolName', 'HostPoolResourceGroup', 'AvdCurrentStatePath', 'EndpointCount', 'NoBastion', 'Fix') {
+foreach ($k in 'Location', 'Role', 'HubPlan', 'DatabasePlan', 'CollectorPlan', 'CollectorCount', 'HubVmSize', 'DatabaseVmSize', 'CollectorVmSize', 'NamePrefix', 'Environment', 'AddressPrefix', 'PeerVnetId', 'EndpointSubnetId', 'HostPoolName', 'HostPoolResourceGroup', 'AvdCurrentStatePath', 'EndpointCount', 'NoBastion', 'Fix') {
   $inputs[$k] = (Get-Variable $k).Value
 }
 $tally = [ordered]@{}

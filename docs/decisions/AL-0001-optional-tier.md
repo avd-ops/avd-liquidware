@@ -3,7 +3,7 @@
 - **Status:** Proposed
 
 ## Context
-FSLogix on Azure Files with Entra Kerberos is the proven default (lesson 0028). Customers leaving Citrix, Omnissa or Ivanti, migrating Windows versions, or replacing Group Policy Preferences after going Entra-only need profile portability, user environment management and app layering for apps that won't convert to MSIX. Liquidware covers those, and CommandCTRL adds real-time support for session hosts and user devices. Most deliveries are into customer environments run by Nerdio Manager for Enterprise. Plain decision and lesson numbers are [avd-landing-zone](https://github.com/nickprignano/avd-landing-zone)'s. Details and sources: [spec.md](../spec.md).
+FSLogix on Azure Files with Entra Kerberos is the proven default (lesson 0028). Customers leaving Citrix, Omnissa or Ivanti, migrating Windows versions, or replacing Group Policy Preferences after going Entra-only need profile portability, user environment management and app layering for apps that won't convert to MSIX. Liquidware covers those, and CommandCTRL adds real-time support for session hosts and user devices. Most deliveries are into customer environments run by Nerdio Manager for Enterprise. Plain decision and lesson numbers are [avd-landing-zone](https://github.com/avd-ops/avd-landing-zone)'s. Details and sources: [spec.md](../spec.md).
 
 ## Decision
 - **Optional and separate:** its own repo and deployment, run against an existing landing zone (avd-landing-zone's or a customer's); in Nerdio environments the same scripts run as scripted actions. avd-landing-zone's default deployment never changes.

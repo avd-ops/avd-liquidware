@@ -191,7 +191,7 @@ Liquidware's sync gives the console an app registration with a client secret and
 ## 9. Stratusphere against the landing zone
 
 The instrument is built (stratusphere/README.md stages 1, 2, 4, 5). What changes is how it is pointed:
-- `Deploy-LiquidwareTier.ps1 -Component Stratusphere` calls `Test-StratusphereReadiness.ps1` and `Deploy-Stratusphere.ps1` with `-Location` = the landing zone's region (northcentralus in the sandbox, so the subscription's allowed-locations policy passes), `-NamePrefix <prefix><env>` (so the resource group is `rg-<prefix><env>-stratusphere` beside the landing zone's), `-PeerVnetId` = the spoke, `-HostPoolName`/`-HostPoolResourceGroup` = the landing zone's, and the callback source = `snet-session-hosts`' prefix instead of `VirtualNetwork` (D-M3);
+- `Deploy-LiquidwareTier.ps1 -Component Stratusphere` calls `Test-StratusphereReadiness.ps1` and `Deploy-Stratusphere.ps1` with `-Location` = the landing zone's region (centralus in the sandbox, so the subscription's allowed-locations policy passes), `-NamePrefix <prefix><env>` (so the resource group is `rg-<prefix><env>-stratusphere` beside the landing zone's), `-PeerVnetId` = the spoke, `-HostPoolName`/`-HostPoolResourceGroup` = the landing zone's, and the callback source = `snet-session-hosts`' prefix instead of `VirtualNetwork` (D-M3);
 - `-NoBastion` by default against a landing zone (Bastion Basic bills by the hour; the Hub console is reached from a session host over the peering, through the browser, by an operator in the admins group). `-Bastion` turns it back on. Bastion Developer (free, same VNet only) is the cheaper choice, and a landing zone deployed with its opt-in jumpbox ([avd-landing-zone decision 0019](https://github.com/avd-ops/avd-landing-zone/blob/master/build/decisions/0019-jumpbox-bastion-developer.md)) gives operators a VM in the spoke, which could reach the Hub console over the peering if the NSGs admitted `snet-jumpbox`'s prefix (not decided);
 - `Deploy-CidKey.ps1 -Action Install` to the landing zone's host pool after the Hub is set up; `Sync-LiquidwareHosts.ps1 -Component Stratusphere` catches hosts added during the window;
 - **The window has an end.** `Deploy` writes `stratusphere-window-end` (default 28 days) as a tag on the resource group; `Check` warns a week before, fails after; `Cleanup -Component Stratusphere` uninstalls the key from every host, then removes the environment and the peering (already built in `Deploy-Stratusphere.ps1 -Action Cleanup -Role Hub`);
@@ -242,7 +242,7 @@ Decision 0010: never guess a price. `Plan` prices each line from the retail pric
 
 | Line | Meter | Hours in a sandbox run |
 |---|---|---|
-| Console VM | `Standard_D2as_v5` Windows, northcentralus | run length |
+| Console VM | `Standard_D2as_v5` Windows, centralus | run length |
 | Console OS disk | Premium SSD P10 | prorated month |
 | Packaging VM (only if packaging is tested) | `Standard_D2as_v5` Windows client | ≤ 2 |
 | NAT Gateway | per hour plus data processed | run length |

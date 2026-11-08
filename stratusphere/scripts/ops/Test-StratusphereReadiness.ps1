@@ -71,7 +71,8 @@ param(
   [string] $Offer = 'stratusphere',
   [string] $ConfigPath = '',
   [string] $OutputPath = '',
-  [switch] $Fix
+  [switch] $Fix,
+  [ValidateSet('Bicep', 'Terraform')] [string] $Engine = 'Bicep'
 )
 
 $ErrorActionPreference = 'Stop'

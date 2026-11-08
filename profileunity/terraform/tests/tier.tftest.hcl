@@ -17,7 +17,7 @@ mock_provider "azurerm" {
 }
 
 variables {
-  location                         = "northcentralus"
+  location                         = "centralus"
   namePrefix                       = "avdlz"
   environment                      = "dev"
   tierAddressPrefix                = "10.61.0.0/24"

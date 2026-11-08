@@ -37,7 +37,7 @@ These hold in every AVD and Liquidware repo:
 
 - **The landing zone's default deployment never changes.** The tier reads the landing zone by its naming convention and writes only the child resources listed in `docs/deploy-spec.md` section 4, each removed by `Cleanup`.
 - **Checks are pure functions** in `scripts/LiquidwareTier.psm1` (prefix `Lw`), taking data read from Azure, tested offline with fixtures that omit empty properties the way ARM does. Approved verbs: `Get-` for functions that only build data.
-- **No cloud run without a written cost estimate and Nick's go.** Sandbox: Nick's personal subscription, northcentralus, smallest sizes, `Cleanup` right after, teardown evidence. Offline checks first (Pester, what-if).
+- **No cloud run without a written cost estimate and Nick's go.** Sandbox: Nick's personal subscription, centralus, smallest sizes, `Cleanup` right after, teardown evidence. Offline checks first (Pester, what-if).
 - **No Liquidware binaries, license material or customer data in this repo.** Operator output goes to `output/` (git-ignored).
 - **Never make operators remember secrets; secrets never go through chat.** VMs read secrets with their own managed identities; the operator writes them through the management plane; anything a Run Command must carry goes in protected parameters.
 - **Liquidware is the only partner.** No Nerdio dependency; other vendors only as prior art.

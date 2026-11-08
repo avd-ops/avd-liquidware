@@ -53,7 +53,7 @@ Describe 'Get-LwLandingZone' {
     $lz = Get-DevLandingZone
     @($lz.Missing).Count | Should -Be 0
     $lz.ConnectivityMode | Should -Be 'Standalone'
-    $lz.Location | Should -Be 'northcentralus'
+    $lz.Location | Should -Be 'centralus'
     $lz.SessionHostSubnetPrefix | Should -Be '10.100.0.0/23'
     $lz.PrivateEndpointSubnetPrefix | Should -Be '10.100.2.0/27'
     $lz.ProfilesAccountId | Should -Match 'stavdlzdevabc123$'
@@ -160,14 +160,18 @@ Describe 'Get-LwAddressCheck' {
 }
 
 Describe 'Get-LwStratusphereArgument' {
-  It 'points the Stratusphere scripts at the landing zone, without Bastion' {
+  It 'points the Stratusphere scripts at the landing zone, without Bastion and with Engine' {
     $a = Get-LwStratusphereArgument -LandingZone (Get-DevLandingZone)
-    $a.Location | Should -Be 'northcentralus'
+    $a.Location | Should -Be 'centralus'
     $a.NamePrefix | Should -Be 'avdlzd'
     $a.PeerVnetId | Should -Match '/virtualNetworks/vnet-avdlz-dev$'
     $a.HostPoolName | Should -Be 'vdpool-avdlz-dev'
     $a.HostPoolResourceGroup | Should -Be 'rg-avdlz-dev-avd'
     $a.NoBastion | Should -BeTrue
+    $a.Engine | Should -Be 'Bicep'
+    $tf = Get-LwStratusphereArgument -LandingZone (Get-DevLandingZone) -Engine Terraform -Bastion
+    $tf.Engine | Should -Be 'Terraform'
+    $tf.NoBastion | Should -BeFalse
   }
   It 'only names parameters Test-StratusphereReadiness.ps1 accepts' {
     $params = (Get-Command (Join-Path $script:root 'stratusphere/scripts/ops/Test-StratusphereReadiness.ps1')).Parameters.Keys
@@ -379,6 +383,7 @@ Describe 'Get-LwPlanSummary' {
     @(Get-LwPlanSummary -Component ProfileUnity, FlexApp -Action Check).Count | Should -Be 0
     @(Get-LwPlanSummary -Component ProfileUnity, FlexApp -Action Cleanup).Count | Should -Be 0
     @(Get-LwPlanSummary -Component ProfileUnity, FlexApp -Action Promote).Count | Should -Be 0
+    @(Get-LwPlanSummary -Component ProfileUnity, FlexApp -Action Configure).Count | Should -Be 0
     $d = @(Get-LwPlanSummary -Component ProfileUnity -Action Deploy)
     $d.Count | Should -Be 1
     $d[0].Check | Should -Be 'budget'
@@ -409,7 +414,7 @@ Describe 'Get-LwMediaLockEntry' {
 Describe 'Get-LwDeletedVault' {
   BeforeAll {
     $script:n = Get-LwName -NamePrefix avdlz -Environment dev
-    function New-Removed($Name) { [pscustomobject]@{ VaultName = $Name; Location = 'northcentralus'; ScheduledPurgeDate = '2026-10-26' } }
+    function New-Removed($Name) { [pscustomobject]@{ VaultName = $Name; Location = 'centralus'; ScheduledPurgeDate = '2026-10-26' } }
   }
   It 'finds the tier vault an earlier Cleanup soft-deleted' {
     $r = Get-LwDeletedVault -Names $script:n -Removed @((New-Removed 'kvavdlzdevlwab12c'), (New-Removed 'kv-other'))
@@ -443,6 +448,19 @@ Describe 'Get-LwCleanupPlan' {
     $steps[0].Parent | Should -Be 'vnet-avdlz-dev'
     $steps[0].ResourceGroup | Should -Be 'rg-avdlz-dev-network'
   }
+  It 'orders host Run Commands, DCR associations, host role assignments, peering, DNS links, portability share (with -RemoveUserData) and tier resource group' {
+    $rc = @([pscustomobject]@{ Name = 'lw-profileunity-client'; VmName = 'vm-sh0'; ResourceGroup = 'rg-avdlz-dev-hosts'; ResourceId = '/x/vm-sh0/runCommands/lw-profileunity-client' })
+    $dcr = @([pscustomobject]@{ Name = 'lw-restrictions'; VmName = 'vm-sh0'; ResourceGroup = 'rg-avdlz-dev-hosts'; ResourceId = '/x/vm-sh0/providers/Microsoft.Insights/dataCollectionRuleAssociations/lw-restrictions' })
+    $ra = @([pscustomobject]@{ RoleDefinitionName = 'Storage File Data SMB Share Reader'; ObjectId = 'sp-sh0'; RoleAssignmentId = '/x/ra1'; Scope = '/x/stlwconfig' })
+    $share = [pscustomobject]@{ Name = 'portability'; StorageAccountName = 'stavdlzdevabc123'; ResourceGroup = 'rg-avdlz-dev-storage'; ResourceId = '/x/stavdlzdevabc123/fileServices/default/shares/portability' }
+    $withoutRemove = @(Get-LwCleanupPlan -Names $script:n -TierGroupExists $true -HostRunCommand $rc -DcrAssociation $dcr -HostRoleAssignment $ra -PortabilityShare $share)
+    @($withoutRemove.Kind) | Should -Not -Contain 'PortabilityShare'
+    $withRemove = @(Get-LwCleanupPlan -Names $script:n -TierGroupExists $true -HostRunCommand $rc -DcrAssociation $dcr -HostRoleAssignment $ra `
+        -Peering @([pscustomobject]@{ Name = 'peer-avdlz-dev-to-liquidware'; RemoteVnetId = $script:tierVnet }) `
+        -DnsLink @((New-Link 'link-avdlz-dev-liquidware' 'privatelink.file.core.windows.net' $script:tierVnet)) `
+        -PortabilityShare $share -RemoveUserData)
+    @($withRemove.Kind) | Should -Be @('HostRunCommand', 'DcrAssociation', 'HostRoleAssignment', 'Peering', 'DnsLink', 'PortabilityShare', 'ResourceGroup')
+  }
   It 'never touches a landing zone peering or link that is not the tier one' {
     $steps = @(Get-LwCleanupPlan -Names $script:n `
         -Peering @([pscustomobject]@{ Name = 'peer-avdlz-dev-to-hub'; RemoteVnetId = $script:otherVnet }, [pscustomobject]@{ Name = 'peer-avdlz-dev-to-liquidware'; RemoteVnetId = $script:otherVnet }) `
@@ -457,16 +475,20 @@ Describe 'Get-LwCleanupPlan' {
 Describe 'Get-LwLastCopyCheck' {
   BeforeAll {
     $script:group = [pscustomobject]@{ Kind = 'ResourceGroup'; Name = 'rg-avdlz-dev-liquidware' }
+    $script:share = [pscustomobject]@{ Kind = 'PortabilityShare'; Name = 'portability'; Parent = 'stavdlzdevabc123' }
     $script:peering = [pscustomobject]@{ Kind = 'Peering'; Name = 'peer-avdlz-dev-to-liquidware' }
   }
-  It 'refuses to remove the tier resource group without -DiscardLastCopy' {
+  It 'refuses to remove the tier resource group or portability share without -DiscardLastCopy' {
     $r = Get-LwLastCopyCheck -Steps @($script:peering, $script:group)
     $r.Status | Should -Be 'FAIL'
     $r.Detail | Should -Match 'only copy'
     $r.Recommendation | Should -Match '-DiscardLastCopy'
+    $rShare = Get-LwLastCopyCheck -Steps @($script:share)
+    $rShare.Status | Should -Be 'FAIL'
+    $rShare.Detail | Should -Match 'portability'
   }
   It 'warns and goes ahead with -DiscardLastCopy' {
-    (Get-LwLastCopyCheck -Steps @($script:group) -DiscardLastCopy).Status | Should -Be 'WARN'
+    (Get-LwLastCopyCheck -Steps @($script:group, $script:share) -DiscardLastCopy).Status | Should -Be 'WARN'
   }
   It 'says nothing when only peerings and links are left' {
     Get-LwLastCopyCheck -Steps @($script:peering) | Should -BeNullOrEmpty
@@ -566,7 +588,23 @@ Describe 'Get-LwCostEstimate' {
     $est = Get-LwCostEstimate -Component ProfileUnity, Stratusphere -Portability -Packaging -Backup -Meter @([pscustomobject]@{ Sku = 'Standard_D2as_v5'; UnitPrice = 0.096; CurrencyCode = 'USD'; UnitOfMeasure = '1 Hour' })
     $est.Warning.Check | Should -Be 'budget'
     ($est.Lines | Where-Object Sku -eq 'Standard_D2as_v5' | Select-Object -First 1).Priced | Should -BeTrue
+    ($est.Lines | Where-Object Sku -eq 'P10 LRS' | Select-Object -First 1).Priced | Should -BeFalse
     ($est.Lines | Where-Object Sku -eq 'Premium_LRS' | Select-Object -First 1).Priced | Should -BeFalse
+  }
+  It 'prices all 9 billable lines from the synthetic Azure Retail Prices API fixture and supports -QueryRetailApi' {
+    $fixture = Get-Fixture 'retail-prices'
+    $est = Get-LwCostEstimate -Component ProfileUnity, FlexApp, Stratusphere -Portability -Packaging -Backup -Meter @($fixture) -Location centralus
+    $est.Location | Should -Be 'centralus'
+    $est.Lines.Count | Should -Be 9
+    @($est.Lines | Where-Object { -not $_.Priced }).Count | Should -Be 0
+    ($est.Lines | Where-Object Sku -eq 'P10 LRS').UnitPrice | Should -Be 19.71
+    ($est.Lines | Where-Object Sku -eq 'Private Endpoint').Quantity | Should -Be 3
+    ($est.Lines | Where-Object Sku -eq 'Premium_LRS').Quantity | Should -Be 100
+    ($est.Lines | Where-Object Sku -eq 'Standard_D4s_v5').UnitPrice | Should -Be 0.192
+    Mock -ModuleName LiquidwareTier Invoke-RestMethod { Get-Content (Join-Path $PSScriptRoot 'fixtures/retail-prices.json') -Raw | ConvertFrom-Json }
+    $apiEst = Get-LwCostEstimate -Component ProfileUnity -QueryRetailApi -Location centralus
+    $apiEst.Lines.Count | Should -Be 5
+    @($apiEst.Lines | Where-Object { -not $_.Priced }).Count | Should -Be 0
   }
 }
 

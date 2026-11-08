@@ -51,12 +51,28 @@ param(
   [switch] $Packaging,
   [ValidateSet('QA', 'All')] [string] $Ring = 'QA',
   [string] $WindowEnd = '',
-  [ValidateSet('Bicep', 'Terraform')] [string] $Engine = 'Bicep'
+  [ValidateSet('Bicep', 'Terraform')] [string] $Engine = 'Bicep',
+  [switch] $RemoveUserData,
+  [string] $ConfigName = 'default',
+  [string] $PromoteTimestamp = '',
+  [string] $StagedIniSha256 = '',
+  [string] $ExportPath = '',
+  [string] $App = '',
+  [string] $Version = '',
+  [string] $HubAddress = '10.60.0.4',
+  [string] $InstallerUrl = '',
+  [string] $InstallerSha256 = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'LiquidwareTier.psm1') -Force
 $reportDir = $(if ($ReportDirectory) { $ReportDirectory } else { Join-Path $PSScriptRoot '../output' })
+$ssuxOpsDir = Join-Path $PSScriptRoot '../stratusphere/scripts/ops'
+foreach ($dir in @($PSScriptRoot, $ssuxOpsDir)) {
+  if (($env:PATH -split [System.IO.Path]::PathSeparator) -notcontains $dir) {
+    $env:PATH = $dir + [System.IO.Path]::PathSeparator + $env:PATH
+  }
+}
 
 $argErrors = @(Get-LwArgumentError -NamePrefix $NamePrefix -Environment $Environment -Component $Component -TierAddressPrefix $TierAddressPrefix)
 if ($argErrors.Count -gt 0) {
@@ -149,8 +165,10 @@ $lz = Get-LwLandingZone -NamePrefix $NamePrefix -Environment $Environment -Resou
 
 # ---------- Cleanup: only the tier's own names, even when the landing zone is half gone ----------
 function Read-TierLeftover {
+  $allGroups = @(Get-AzResourceGroup | Select-Object -ExpandProperty ResourceGroupName)
+  $tierExists = $allGroups -contains $names.TierGroup
   $links = @()
-  if ((@(Get-AzResourceGroup | Select-Object -ExpandProperty ResourceGroupName)) -contains $names.ResourceGroups.Network) {
+  if ($allGroups -contains $names.ResourceGroups.Network) {
     foreach ($z in @(Get-AzPrivateDnsZone -ResourceGroupName $names.ResourceGroups.Network)) {
       $links += @(Get-AzPrivateDnsVirtualNetworkLink -ResourceGroupName $names.ResourceGroups.Network -ZoneName $z.Name | ForEach-Object {
           [pscustomobject]@{ Name = $_.Name; ZoneName = $z.Name; VirtualNetworkId = $_.VirtualNetworkId; ResourceId = $_.ResourceId }
@@ -158,43 +176,112 @@ function Read-TierLeftover {
     }
   }
   $spoke = Get-AzVirtualNetwork -ResourceGroupName $names.ResourceGroups.Network -Name $names.Vnet -ErrorAction SilentlyContinue
+  $hostRcs = @()
+  $dcrAssocs = @()
+  if ($allGroups -contains $names.ResourceGroups.Hosts) {
+    $hostRes = @(Get-AzResource -ResourceGroupName $names.ResourceGroups.Hosts)
+    $hostRcs = @($hostRes | Where-Object { $_ -and $_.ResourceType -eq 'Microsoft.Compute/virtualMachines/runCommands' -and ($_.Name -split '/')[-1] -eq 'lw-profileunity-client' } | ForEach-Object {
+        [pscustomobject]@{ Name = 'lw-profileunity-client'; VmName = ($_.Name -split '/')[0]; ResourceGroup = $names.ResourceGroups.Hosts; ResourceId = $_.ResourceId }
+      })
+    $dcrAssocs = @($hostRes | Where-Object { $_ -and $_.ResourceType -eq 'Microsoft.Insights/dataCollectionRuleAssociations' -and ($_.Name -split '/')[-1] -eq 'lw-restrictions' } | ForEach-Object {
+        [pscustomobject]@{ Name = 'lw-restrictions'; VmName = ($_.Name -split '/')[0]; ResourceGroup = $names.ResourceGroups.Hosts; ResourceId = $_.ResourceId }
+      })
+  }
+  $hostRas = @()
+  if ($tierExists) {
+    $subId = $(if ($context.Subscription -and $context.Subscription.PSObject.Properties['Id'] -and $context.Subscription.Id) { $context.Subscription.Id } else { '00000000-0000-0000-0000-000000000000' })
+    $tierScope = "/subscriptions/$subId/resourceGroups/$($names.TierGroup)"
+    $hostRas = @(Get-AzRoleAssignment -Scope $tierScope -ErrorAction SilentlyContinue | Where-Object {
+        $_ -and $_.ObjectType -eq 'ServicePrincipal' -and $_.RoleDefinitionName -in 'Storage File Data SMB Share Reader', 'Storage File Data SMB Share Contributor'
+      } | ForEach-Object {
+        [pscustomobject]@{ RoleDefinitionName = $_.RoleDefinitionName; ObjectId = $_.ObjectId; RoleAssignmentId = $_.RoleAssignmentId; Scope = $_.Scope }
+      })
+  }
+  $portShare = $null
+  if ($allGroups -contains $names.ResourceGroups.Storage) {
+    $stgRes = @(Get-AzResource -ResourceGroupName $names.ResourceGroups.Storage)
+    $hitShare = @($stgRes | Where-Object { $_ -and $_.ResourceType -eq 'Microsoft.Storage/storageAccounts/fileServices/shares' -and ($_.Name -split '/')[-1] -eq 'portability' }) | Select-Object -First 1
+    if ($hitShare) {
+      $portShare = [pscustomobject]@{ Name = 'portability'; StorageAccountName = ($hitShare.Name -split '/')[0]; ResourceGroup = $names.ResourceGroups.Storage; ResourceId = $hitShare.ResourceId }
+    }
+  }
   [pscustomobject]@{
-    TierGroupExists = (@(Get-AzResourceGroup | Select-Object -ExpandProperty ResourceGroupName)) -contains $names.TierGroup
-    Peering         = @($(if ($spoke) { @($spoke.VirtualNetworkPeerings | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ Name = $_.Name; RemoteVnetId = $_.RemoteVirtualNetwork.Id } }) }))
-    DnsLink         = $links
+    TierGroupExists    = $tierExists
+    Peering            = @($(if ($spoke) { @($spoke.VirtualNetworkPeerings | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ Name = $_.Name; RemoteVnetId = $_.RemoteVirtualNetwork.Id } }) }))
+    DnsLink            = $links
+    HostRunCommand     = $hostRcs
+    DcrAssociation     = $dcrAssocs
+    HostRoleAssignment = $hostRas
+    PortabilityShare   = $portShare
   }
 }
 
+$profileUnity = @($Component | Where-Object { $_ -in 'ProfileUnity', 'FlexApp' }).Count -gt 0
+
 if ($Action -eq 'Cleanup') {
-  $before = Read-TierLeftover
-  $steps = @(Get-LwCleanupPlan -Names $names -TierGroupExists $before.TierGroupExists -Peering $before.Peering -DnsLink $before.DnsLink)
-  if ($steps.Count -eq 0) { Add-Result (Get-LwCheckResult PASS 'cleanup' 'Nothing of the tier is left to remove.' -Category Cleanup) }
-  foreach ($st in $steps) { Add-Result (Get-LwCheckResult INFO 'cleanup-step' "$($st.Kind) $($st.Name)$(if ($st.Parent) { " on $($st.Parent)" })" -Category Cleanup) }
-  $lastCopy = Get-LwLastCopyCheck -Steps $steps -DiscardLastCopy:$DiscardLastCopy
-  if ($lastCopy) { Add-Result $lastCopy }
-  # -WhatIf still lists the steps; a real run stops here.
-  if ($lastCopy.Status -eq 'FAIL' -and -not $WhatIfPreference) { Complete-Run }
-  if ($steps.Count -gt 0 -and (Confirm-Step -Target $names.TierGroup -What "Remove the $($steps.Count) items above" -Force:$Force)) {
-    foreach ($st in $steps) {
-      try {
-        switch ($st.Kind) {
-          'Peering' { Remove-AzVirtualNetworkPeering -Name $st.Name -VirtualNetworkName $st.Parent -ResourceGroupName $st.ResourceGroup -Force }
-          'DnsLink' { Remove-AzPrivateDnsVirtualNetworkLink -ResourceId $st.ResourceId }
-          'ResourceGroup' {
-            Write-Host "Removing $($st.Name) (this takes several minutes) ..."
-            $null = Remove-AzResourceGroup -Name $st.Name -Force
-          }
-        }
-        Add-Result (Get-LwCheckResult PASS 'cleanup-step' "Removed $($st.Kind) $($st.Name)" -Category Cleanup)
-      }
-      catch {
-        Add-Result (Get-LwCheckResult FAIL 'cleanup-step' "$($st.Kind) $($st.Name): $($_.Exception.Message)" -Recommendation 'Run Cleanup again.' -Category Cleanup)
-      }
+  if ($Component -contains 'Stratusphere') {
+    $ssux = Get-LwStratusphereArgument -LandingZone $lz -Engine $Engine -Bastion:$Bastion
+    if ($ssux.HostPoolName) {
+      $global:LASTEXITCODE = 0
+      Deploy-CidKey.ps1 -HostPoolName $ssux.HostPoolName -HostPoolResourceGroup $ssux.HostPoolResourceGroup -Action Cleanup -Force:$Force -OutputPath $reportDir
     }
-    $after = Read-TierLeftover
-    Add-Result (Get-LwTeardownCheck -Names $names -TierGroupExists $after.TierGroupExists -Peering $after.Peering -DnsLink $after.DnsLink)
-    Add-Result (Get-LwCheckResult INFO 'key-vault' 'The tier Key Vault stays soft-deleted for 7 days (purge protection); a Deploy in that time recovers it.' -Category Cleanup)
-    Add-Result (Get-LwCheckResult WARN 'entra-kerberos-app' 'Entra Kerberos may leave an app registration named [Storage Account] <config account>.file.core.windows.net (unconfirmed).' -Recommendation 'Look for it in Entra app registrations and delete it if it outlived the account.' -Category Cleanup)
+    $deploySsux = @{}
+    foreach ($k in $ssux.Keys) { if ($k -notin 'HostPoolName', 'HostPoolResourceGroup') { $deploySsux[$k] = $ssux[$k] } }
+    $global:LASTEXITCODE = 0
+    Deploy-Stratusphere.ps1 @deploySsux -Action Cleanup -Force:$Force -DiscardLastCopy:$DiscardLastCopy -OutputPath $reportDir -WhatIf:$WhatIfPreference
+    Add-Result (Get-LwCheckResult $(if ($LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' }) 'stratusphere-cleanup' 'Stratusphere CID key and appliance cleanup completed.' -Category Stratusphere)
+  }
+  if ($Component -contains 'CommandCTRL') {
+    $global:LASTEXITCODE = 0
+    Sync-LiquidwareHosts.ps1 -NamePrefix $NamePrefix -Environment $Environment -Component CommandCTRL -Action Cleanup -SubscriptionId $SubscriptionId -ReportDirectory $reportDir -Force:$Force -WhatIf:$WhatIfPreference
+    Add-Result (Get-LwCheckResult $(if ($LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' }) 'commandctrl-cleanup' 'CommandCTRL host cleanup completed.' -Category CommandCTRL)
+  }
+  if ($profileUnity) {
+    $before = Read-TierLeftover
+    $steps = @(Get-LwCleanupPlan -Names $names -TierGroupExists $before.TierGroupExists -Peering $before.Peering -DnsLink $before.DnsLink `
+        -HostRunCommand $before.HostRunCommand -DcrAssociation $before.DcrAssociation -HostRoleAssignment $before.HostRoleAssignment `
+        -PortabilityShare $before.PortabilityShare -RemoveUserData:$RemoveUserData)
+    if ($steps.Count -eq 0) { Add-Result (Get-LwCheckResult PASS 'cleanup' 'Nothing of the tier is left to remove.' -Category Cleanup) }
+    foreach ($st in $steps) { Add-Result (Get-LwCheckResult INFO 'cleanup-step' "$($st.Kind) $($st.Name)$(if ($st.Parent) { " on $($st.Parent)" })" -Category Cleanup) }
+    if ($before.PortabilityShare -and -not $RemoveUserData) {
+      Add-Result (Get-LwCheckResult INFO 'portability-retained' "Share portability on $($before.PortabilityShare.StorageAccountName) preserved (pass -RemoveUserData -DiscardLastCopy to delete user portability archives)." -Category Cleanup)
+    }
+    $lastCopy = Get-LwLastCopyCheck -Steps $steps -DiscardLastCopy:$DiscardLastCopy
+    if ($lastCopy) { Add-Result $lastCopy }
+    # -WhatIf still lists the steps; a real run stops here.
+    if ($lastCopy.Status -eq 'FAIL' -and -not $WhatIfPreference) { Complete-Run }
+    if ($steps.Count -gt 0 -and (Confirm-Step -Target $names.TierGroup -What "Remove the $($steps.Count) items above" -Force:$Force)) {
+      if (@($steps | Where-Object Kind -eq 'HostRunCommand').Count -gt 0) {
+        $global:LASTEXITCODE = 0
+        Sync-LiquidwareHosts.ps1 -NamePrefix $NamePrefix -Environment $Environment -Component ProfileUnity -Action Cleanup -SubscriptionId $SubscriptionId -ReportDirectory $reportDir -Force:$Force
+      }
+      foreach ($st in $steps) {
+        try {
+          switch ($st.Kind) {
+            'HostRunCommand' { Remove-AzVMRunCommand -ResourceGroupName $st.ResourceGroup -VMName $st.Parent -RunCommandName $st.Name }
+            'DcrAssociation' { Remove-AzResource -ResourceId $st.ResourceId -Force }
+            'HostRoleAssignment' { Remove-AzRoleAssignment -ObjectId $st.Parent -RoleDefinitionName $st.Name -Scope $st.Scope }
+            'Peering' { Remove-AzVirtualNetworkPeering -Name $st.Name -VirtualNetworkName $st.Parent -ResourceGroupName $st.ResourceGroup -Force }
+            'DnsLink' { Remove-AzPrivateDnsVirtualNetworkLink -ResourceId $st.ResourceId }
+            'PortabilityShare' { Remove-AzResource -ResourceId $st.ResourceId -Force }
+            'ResourceGroup' {
+              Write-Host "Removing $($st.Name) (this takes several minutes) ..."
+              $null = Remove-AzResourceGroup -Name $st.Name -Force
+            }
+          }
+          Add-Result (Get-LwCheckResult PASS 'cleanup-step' "Removed $($st.Kind) $($st.Name)" -Category Cleanup)
+        }
+        catch {
+          Add-Result (Get-LwCheckResult FAIL 'cleanup-step' "$($st.Kind) $($st.Name): $($_.Exception.Message)" -Recommendation 'Run Cleanup again.' -Category Cleanup)
+        }
+      }
+      $after = Read-TierLeftover
+      Add-Result (Get-LwTeardownCheck -Names $names -TierGroupExists $after.TierGroupExists -Peering $after.Peering -DnsLink $after.DnsLink `
+          -HostRunCommand $after.HostRunCommand -DcrAssociation $after.DcrAssociation -HostRoleAssignment $after.HostRoleAssignment `
+          -PortabilityShare $after.PortabilityShare -RemoveUserData:$RemoveUserData)
+      Add-Result (Get-LwCheckResult INFO 'key-vault' 'The tier Key Vault stays soft-deleted for 7 days (purge protection); a Deploy in that time recovers it.' -Category Cleanup)
+      Add-Result (Get-LwCheckResult WARN 'entra-kerberos-app' 'Entra Kerberos may leave an app registration named [Storage Account] <config account>.file.core.windows.net (unconfirmed).' -Recommendation 'Look for it in Entra app registrations and delete it if it outlived the account.' -Category Cleanup)
+    }
   }
   Complete-Run
 }
@@ -204,15 +291,149 @@ if (@($lz.VnetAddressPrefixes).Count -gt 0) {
   Add-Result (Get-LwAddressCheck -TierAddressPrefix $TierAddressPrefix -LandingZone $lz)
 }
 
+if ($Action -eq 'Plan') {
+  $enableBackupCost = ($Environment -in 'test', 'prod')
+  $costEst = Get-LwCostEstimate -Location $(if ($lz.Location) { $lz.Location } else { 'centralus' }) -QueryRetailApi `
+    -Component $Component -Portability:$Portability -Packaging:$Packaging -Backup:$enableBackupCost
+  foreach ($cl in $costEst.Lines) {
+    Add-Result (Get-LwCheckResult INFO 'cost-estimate' $cl.Detail -Category Cost)
+  }
+}
+
 if ($Component -contains 'Stratusphere' -and @($lz.Missing).Count -eq 0) {
-  $ssux = Get-LwStratusphereArgument -LandingZone $lz
+  $ssux = Get-LwStratusphereArgument -LandingZone $lz -Engine $Engine -Bastion:$Bastion
   $line = ($ssux.GetEnumerator() | ForEach-Object { if ($_.Value -is [bool]) { if ($_.Value) { "-$($_.Key)" } } else { "-$($_.Key) $($_.Value)" } }) -join ' '
   Add-Result (Get-LwCheckResult INFO 'stratusphere-arguments' "stratusphere/scripts/ops/Test-StratusphereReadiness.ps1 $line" -Category Stratusphere)
   Add-Result (Get-LwStratusphereWindowCheck -WindowEnd $WindowEnd)
+  $deploySsux = @{}
+  foreach ($k in $ssux.Keys) { if ($k -notin 'HostPoolName', 'HostPoolResourceGroup') { $deploySsux[$k] = $ssux[$k] } }
+  switch ($Action) {
+    'Plan' {
+      $global:LASTEXITCODE = 0
+      Test-StratusphereReadiness.ps1 @ssux -OutputPath $reportDir
+      $readinessCode = $LASTEXITCODE
+      $global:LASTEXITCODE = 0
+      Deploy-Stratusphere.ps1 @deploySsux -Action Plan -OutputPath $reportDir -WhatIf:$WhatIfPreference
+      $status = $(if ($readinessCode -eq 0 -and $LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' })
+      Add-Result (Get-LwCheckResult $status 'stratusphere-plan' 'Test-StratusphereReadiness.ps1 and Deploy-Stratusphere.ps1 -Action Plan completed.' -Category Stratusphere)
+    }
+    'Check' {
+      $global:LASTEXITCODE = 0
+      Test-StratusphereReadiness.ps1 @ssux -OutputPath $reportDir
+      $readinessCode = $LASTEXITCODE
+      $global:LASTEXITCODE = 0
+      Deploy-Stratusphere.ps1 @deploySsux -Action Check -OutputPath $reportDir
+      $status = $(if ($readinessCode -eq 0 -and $LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' })
+      Add-Result (Get-LwCheckResult $status 'stratusphere-check' 'Test-StratusphereReadiness.ps1 and Deploy-Stratusphere.ps1 -Action Check completed.' -Category Stratusphere)
+    }
+    'Deploy' {
+      $global:LASTEXITCODE = 0
+      Test-StratusphereReadiness.ps1 @ssux -OutputPath $reportDir
+      if ($LASTEXITCODE -eq 0) {
+        $global:LASTEXITCODE = 0
+        Deploy-Stratusphere.ps1 @deploySsux -Action Deploy -Force:$Force -OutputPath $reportDir -WhatIf:$WhatIfPreference
+      }
+      Add-Result (Get-LwCheckResult $(if ($LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' }) 'stratusphere-deploy' 'Test-StratusphereReadiness.ps1 and Deploy-Stratusphere.ps1 -Action Deploy completed.' -Category Stratusphere)
+    }
+    'Configure' {
+      $global:LASTEXITCODE = 0
+      Deploy-CidKey.ps1 -HostPoolName $ssux.HostPoolName -HostPoolResourceGroup $ssux.HostPoolResourceGroup -Action Install -HubAddress $HubAddress -InstallerUrl $InstallerUrl -InstallerSha256 $InstallerSha256 -Force:$Force -OutputPath $reportDir
+      Add-Result (Get-LwCheckResult $(if ($LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' }) 'stratusphere-configure' "Deploy-CidKey.ps1 -Action Install on $($ssux.HostPoolName) completed." -Category Stratusphere)
+    }
+    'Fix' {
+      $global:LASTEXITCODE = 0
+      Test-StratusphereReadiness.ps1 @ssux -Fix -OutputPath $reportDir
+      $readinessCode = $LASTEXITCODE
+      $global:LASTEXITCODE = 0
+      Deploy-Stratusphere.ps1 @deploySsux -Action Fix -Force:$Force -OutputPath $reportDir -WhatIf:$WhatIfPreference
+      $status = $(if ($readinessCode -eq 0 -and $LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' })
+      Add-Result (Get-LwCheckResult $status 'stratusphere-fix' 'Test-StratusphereReadiness.ps1 -Fix and Deploy-Stratusphere.ps1 -Action Fix completed.' -Category Stratusphere)
+    }
+  }
 }
 
-$profileUnity = @($Component | Where-Object { $_ -in 'ProfileUnity', 'FlexApp' }).Count -gt 0
-if ($profileUnity -and $Action -in 'Plan', 'Deploy' -and @($results | Where-Object Status -eq 'FAIL').Count -eq 0) {
+if ($Component -contains 'CommandCTRL' -and @($lz.Missing).Count -eq 0 -and $Action -in 'Check', 'Configure') {
+  $global:LASTEXITCODE = 0
+  Sync-LiquidwareHosts.ps1 -NamePrefix $NamePrefix -Environment $Environment -Component CommandCTRL -Action $Action -SubscriptionId $SubscriptionId -ReportDirectory $reportDir -Force:$Force -WhatIf:$WhatIfPreference
+  Add-Result (Get-LwCheckResult $(if ($LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' }) "commandctrl-$($Action.ToLower())" "Sync-LiquidwareHosts.ps1 -Component CommandCTRL -Action $Action completed." -Category CommandCTRL)
+}
+
+if ($profileUnity -and $Action -eq 'Configure' -and @($results | Where-Object Status -eq 'FAIL').Count -eq 0) {
+  $global:LASTEXITCODE = 0
+  Sync-LiquidwareHosts.ps1 -NamePrefix $NamePrefix -Environment $Environment -Component ProfileUnity -Action Configure -SubscriptionId $SubscriptionId -ReportDirectory $reportDir -Force:$Force -WhatIf:$WhatIfPreference
+  Add-Result (Get-LwCheckResult $(if ($LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' }) 'host-configure' 'Sync-LiquidwareHosts.ps1 -Component ProfileUnity -Action Configure completed.' -Category ProfileUnity)
+}
+
+if ($profileUnity -and $Action -eq 'Promote' -and @($results | Where-Object Status -eq 'FAIL').Count -eq 0) {
+  if ($Component -contains 'ProfileUnity') {
+    $ts = $(if ($PromoteTimestamp) { $PromoteTimestamp } else { (Get-Date -AsUTC -Format 'yyyyMMddTHHmmssZ') })
+    $global:LASTEXITCODE = 0
+    Publish-ProfileUnityConfig.ps1 -NamePrefix $NamePrefix -Environment $Environment -ConfigName $ConfigName -Promote $ts -Ring $Ring -StagedIniSha256 $StagedIniSha256 -ExportPath $ExportPath -SubscriptionId $SubscriptionId -ReportDirectory $reportDir -Force:$Force -WhatIf:$WhatIfPreference
+    Add-Result (Get-LwCheckResult $(if ($LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' }) 'promote-config' "Publish-ProfileUnityConfig.ps1 ($ConfigName -> $Ring) completed." -Category Promote)
+  }
+  if ($Component -contains 'FlexApp') {
+    $appName = $(if ($App) { $App } else { 'default' })
+    $appVer = $(if ($Version) { $Version } else { '1.0.0' })
+    $global:LASTEXITCODE = 0
+    Set-FlexAppAssignment.ps1 -NamePrefix $NamePrefix -Environment $Environment -App $appName -Version $appVer -Ring $Ring -SubscriptionId $SubscriptionId -ReportDirectory $reportDir -WhatIf:$WhatIfPreference
+    Add-Result (Get-LwCheckResult $(if ($LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' }) 'promote-flexapp' "Set-FlexAppAssignment.ps1 ($appName $appVer -> $Ring) completed." -Category FlexApp)
+  }
+}
+
+if ($profileUnity -and $Action -in 'Check', 'Fix' -and @($results | Where-Object Status -eq 'FAIL').Count -eq 0) {
+  if ($groups -notcontains $names.TierGroup) {
+    if ($Action -eq 'Check') {
+      Add-Result (Get-LwCheckResult FAIL 'tier-group' "Resource group $($names.TierGroup) not found." -Recommendation 'Run Deploy-LiquidwareTier.ps1 -Action Deploy or Fix.' -Category ProfileUnity)
+    }
+    else {
+      Add-Result (Get-LwCheckResult WARN 'tier-group' "Resource group $($names.TierGroup) not found; Fix will deploy the tier template." -Category ProfileUnity)
+    }
+  }
+  else {
+    $vmStatus = $(try { Get-AzVM -ResourceGroupName $names.TierGroup -Name $names.ConsoleVm -Status -ErrorAction Stop } catch { $null })
+    if (-not $vmStatus) {
+      if ($Action -eq 'Check') {
+        Add-Result (Get-LwCheckResult FAIL 'console-vm' "Console VM $($names.ConsoleVm) not found in $($names.TierGroup)." -Recommendation 'Run Deploy-LiquidwareTier.ps1 -Action Fix or Deploy.' -Category ProfileUnity)
+      }
+      else {
+        Add-Result (Get-LwCheckResult WARN 'console-vm' "Console VM $($names.ConsoleVm) not found; Fix will redeploy the tier template." -Category ProfileUnity)
+      }
+    }
+    else {
+      $power = @($vmStatus.Statuses | Where-Object Code -like 'PowerState/*').Code
+      if ($power -ne 'PowerState/running') {
+        if ($Action -eq 'Check') {
+          Add-Result (Get-LwCheckResult WARN 'console-power' "$($names.ConsoleVm) is $power." -Recommendation 'Start the console VM or run Deploy-LiquidwareTier.ps1 -Action Fix.' -Category ProfileUnity)
+        }
+        elseif (Confirm-Step -Target $names.ConsoleVm -What 'Start stopped console VM' -Force:$Force) {
+          $null = Start-AzVM -ResourceGroupName $names.TierGroup -Name $names.ConsoleVm
+          Add-Result (Get-LwCheckResult PASS 'console-fix' "Started $($names.ConsoleVm)." -Category ProfileUnity)
+        }
+      }
+      else {
+        Add-Result (Get-LwCheckResult PASS 'console-power' "$($names.ConsoleVm) is running." -Category ProfileUnity)
+      }
+    }
+  }
+  $global:LASTEXITCODE = 0
+  Sync-LiquidwareHosts.ps1 -NamePrefix $NamePrefix -Environment $Environment -Component ProfileUnity -Action Check -SubscriptionId $SubscriptionId -ReportDirectory $reportDir
+  if ($LASTEXITCODE -ne 0) {
+    if ($Action -eq 'Check') {
+      Add-Result (Get-LwCheckResult FAIL 'host-check' 'One or more session hosts are unconfigured or unhealthy.' -Recommendation 'Run Deploy-LiquidwareTier.ps1 -Action Fix or Configure.' -Category ProfileUnity)
+    }
+    else {
+      Add-Result (Get-LwCheckResult WARN 'host-check' 'Session hosts need repair; running Sync-LiquidwareHosts.ps1 -Action Configure ...' -Category ProfileUnity)
+      $global:LASTEXITCODE = 0
+      Sync-LiquidwareHosts.ps1 -NamePrefix $NamePrefix -Environment $Environment -Component ProfileUnity -Action Configure -SubscriptionId $SubscriptionId -ReportDirectory $reportDir -Force:$Force -WhatIf:$WhatIfPreference
+      Add-Result (Get-LwCheckResult $(if ($LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' }) 'host-fix' 'Sync-LiquidwareHosts.ps1 -Action Configure completed.' -Category ProfileUnity)
+    }
+  }
+  else {
+    Add-Result (Get-LwCheckResult PASS 'host-check' 'Session hosts passed Sync-LiquidwareHosts.ps1 -Action Check.' -Category ProfileUnity)
+  }
+}
+
+if ($profileUnity -and $Action -in 'Plan', 'Deploy', 'Fix' -and @($results | Where-Object Status -eq 'FAIL').Count -eq 0) {
   Write-Host 'Reading the users group and the Azure Virtual Desktop service principals ...'
   $assignments = @(Get-AzRoleAssignment -Scope $lz.ProfilesAccountId | ForEach-Object {
       [pscustomobject]@{ ObjectId = $_.ObjectId; ObjectType = $_.ObjectType; RoleDefinitionName = $_.RoleDefinitionName }
@@ -293,7 +514,7 @@ if ($profileUnity -and $Action -in 'Plan', 'Deploy' -and @($results | Where-Obje
               Add-Result (Get-LwCheckResult INFO 'terraform-plan' 'terraform plan succeeded on profileunity/terraform.' -Category 'Plan')
             }
           }
-          if ($Action -eq 'Deploy' -and @($results | Where-Object Status -eq 'FAIL').Count -eq 0 -and
+          if ($Action -in 'Deploy', 'Fix' -and @($results | Where-Object Status -eq 'FAIL').Count -eq 0 -and
             (Confirm-Step -Target $names.TierGroup -What 'Deploy the changes above (Terraform)' -Force:$Force)) {
             if ($deleted.Vault) {
               if ($groups -notcontains $names.TierGroup) { $null = New-AzResourceGroup -Name $names.TierGroup -Location $lz.Location }
@@ -324,9 +545,11 @@ if ($profileUnity -and $Action -in 'Plan', 'Deploy' -and @($results | Where-Obje
       $whatIf = Get-AzSubscriptionDeploymentWhatIfResult -Name "liquidware-$($names.Base)" -Location $lz.Location `
         -TemplateFile (Join-Path $PSScriptRoot '../profileunity/bicep/main.bicep') -TemplateParameterObject $templateParams
       $changes = @($whatIf.Changes | ForEach-Object { [pscustomobject]@{ ChangeType = "$($_.ChangeType)"; ResourceId = $_.FullyQualifiedResourceId } })
-      Add-Result (Get-LwWhatIfSummary -Change $changes -LandingZone $lz)
+      $whatIfResults = @(Get-LwWhatIfSummary -Change $changes -LandingZone $lz)
+      Add-Result $whatIfResults
+      $hasDrift = (@($whatIfResults | Where-Object Status -eq 'INFO').Count -gt 0) -or ($groups -notcontains $names.TierGroup)
 
-      if ($Action -eq 'Deploy' -and @($results | Where-Object Status -eq 'FAIL').Count -eq 0 -and
+      if (($Action -eq 'Deploy' -or ($Action -eq 'Fix' -and $hasDrift)) -and @($results | Where-Object Status -eq 'FAIL').Count -eq 0 -and
         (Confirm-Step -Target $names.TierGroup -What 'Deploy the changes above' -Force:$Force)) {
         if ($deleted.Vault) {
           if ($groups -notcontains $names.TierGroup) { $null = New-AzResourceGroup -Name $names.TierGroup -Location $lz.Location }

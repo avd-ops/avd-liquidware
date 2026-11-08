@@ -247,7 +247,7 @@ Spend rule: Nick pays; estimate first, evidence after, teardown evidence, monthl
 
 ### 11.2 Spike L0 (the owner's personal sandbox)
 - **Licenses:** Liquidware trial (ProfileUnity/FlexApp) and CommandCTRL Community Edition: $0.
-- **Azure, one run, northcentralus, target under 4 hours:** the existing dev landing zone's one session host (already sized), one console VM at the smallest supported SKU, a Standard packages storage account with a few GiB, the Defender lines those two add, and Bastion Developer (free) only if the console UI is needed. Setup goes through Run Command.
+- **Azure, one run, centralus, target under 4 hours:** the existing dev landing zone's one session host (already sized), one console VM at the smallest supported SKU, a Standard packages storage account with a few GiB, the Defender lines those two add, and Bastion Developer (free) only if the console UI is needed. Setup goes through Run Command.
 - **Before the run:** price the list with the preflight's retail lookup, post the estimate, get Nick's go. **After:** teardown evidence (RG not found), spend evidence kept privately, outside this public repo.
 
 ## 12. Facts and what is still unverified

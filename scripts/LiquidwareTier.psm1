@@ -212,7 +212,11 @@ function Get-LwAddressCheck {
 function Get-LwStratusphereArgument {
   # The Stratusphere scripts' parameters, pointed at the landing zone (deploy-spec section 9).
   [CmdletBinding()]
-  param([Parameter(Mandatory)] $LandingZone)
+  param(
+    [Parameter(Mandatory)] $LandingZone,
+    [ValidateSet('Bicep', 'Terraform')] [string] $Engine = 'Bicep',
+    [switch] $Bastion
+  )
   $lz = $LandingZone
   $hp = $(if ($lz.HostPoolId) { ($lz.HostPoolId -split '/') } else { @() })
   [ordered]@{
@@ -221,7 +225,8 @@ function Get-LwStratusphereArgument {
     PeerVnetId            = $lz.VnetId
     HostPoolName          = $(if ($hp.Count -ge 9) { $hp[8] } else { '' })
     HostPoolResourceGroup = $(if ($hp.Count -ge 5) { $hp[4] } else { '' })
-    NoBastion             = $true
+    NoBastion             = (-not $Bastion)
+    Engine                = $Engine
   }
 }
 
@@ -494,15 +499,44 @@ function Get-LwCleanupPlan {
     [Parameter(Mandatory)] $Names,
     [bool] $TierGroupExists = $false,
     [AllowEmptyCollection()] [object[]] $Peering = @(),
-    [AllowEmptyCollection()] [object[]] $DnsLink = @()
+    [AllowEmptyCollection()] [object[]] $DnsLink = @(),
+    [AllowEmptyCollection()] [object[]] $HostRunCommand = @(),
+    [AllowEmptyCollection()] [object[]] $DcrAssociation = @(),
+    [AllowEmptyCollection()] [object[]] $HostRoleAssignment = @(),
+    $PortabilityShare = $null,
+    [switch] $RemoveUserData
   )
   $tierVnet = "/resourceGroups/$($Names.TierGroup)/providers/Microsoft.Network/virtualNetworks/$($Names.TierVnet)"
   $steps = [System.Collections.Generic.List[object]]::new()
+  foreach ($rc in @($HostRunCommand | Where-Object { $_ -and $_.Name -eq 'lw-profileunity-client' })) {
+    $rg = $(if ($rc.PSObject.Properties['ResourceGroup'] -and $rc.ResourceGroup) { "$($rc.ResourceGroup)" } else { $Names.ResourceGroups.Hosts })
+    $resId = $(if ($rc.PSObject.Properties['ResourceId'] -and $rc.ResourceId) { "$($rc.ResourceId)" } else { '' })
+    $steps.Add([pscustomobject]@{ Kind = 'HostRunCommand'; Name = $rc.Name; Parent = "$($rc.VmName)"; ResourceGroup = $rg; ResourceId = $resId })
+  }
+  foreach ($dcr in @($DcrAssociation | Where-Object { $_ -and $_.Name -eq 'lw-restrictions' })) {
+    $rg = $(if ($dcr.PSObject.Properties['ResourceGroup'] -and $dcr.ResourceGroup) { "$($dcr.ResourceGroup)" } else { $Names.ResourceGroups.Hosts })
+    $resId = $(if ($dcr.PSObject.Properties['ResourceId'] -and $dcr.ResourceId) { "$($dcr.ResourceId)" } else { '' })
+    $steps.Add([pscustomobject]@{ Kind = 'DcrAssociation'; Name = $dcr.Name; Parent = "$($dcr.VmName)"; ResourceGroup = $rg; ResourceId = $resId })
+  }
+  foreach ($ra in @($HostRoleAssignment | Where-Object { $_ })) {
+    $resId = $(if ($ra.PSObject.Properties['RoleAssignmentId'] -and $ra.RoleAssignmentId) { "$($ra.RoleAssignmentId)" } else { '' })
+    $scope = $(if ($ra.PSObject.Properties['Scope'] -and $ra.Scope) { "$($ra.Scope)" } else { '' })
+    $steps.Add([pscustomobject]@{ Kind = 'HostRoleAssignment'; Name = "$($ra.RoleDefinitionName)"; Parent = "$($ra.ObjectId)"; ResourceGroup = $Names.TierGroup; ResourceId = $resId; Scope = $scope })
+  }
   foreach ($p in @($Peering | Where-Object { $_ -and $_.Name -eq $Names.PeeringToTier -and "$($_.RemoteVnetId)" -like "*$tierVnet" })) {
     $steps.Add([pscustomobject]@{ Kind = 'Peering'; Name = $p.Name; Parent = $Names.Vnet; ResourceGroup = $Names.ResourceGroups.Network; ResourceId = '' })
   }
   foreach ($l in @($DnsLink | Where-Object { $_ -and $_.Name -eq "link-$($Names.Base)-liquidware" -and "$($_.VirtualNetworkId)" -like "*$tierVnet" })) {
     $steps.Add([pscustomobject]@{ Kind = 'DnsLink'; Name = $l.Name; Parent = $l.ZoneName; ResourceGroup = $Names.ResourceGroups.Network; ResourceId = $l.ResourceId })
+  }
+  if ($PortabilityShare -and $RemoveUserData) {
+    $shareName = $(if ($PortabilityShare.PSObject.Properties['Name'] -and $PortabilityShare.Name) { "$($PortabilityShare.Name)" } else { 'portability' })
+    $acctName = $(if ($PortabilityShare.PSObject.Properties['StorageAccountName'] -and $PortabilityShare.StorageAccountName) { "$($PortabilityShare.StorageAccountName)" } else { '' })
+    $rgName = $(if ($PortabilityShare.PSObject.Properties['ResourceGroup'] -and $PortabilityShare.ResourceGroup) { "$($PortabilityShare.ResourceGroup)" } else { $Names.ResourceGroups.Storage })
+    $resId = $(if ($PortabilityShare.PSObject.Properties['ResourceId'] -and $PortabilityShare.ResourceId) { "$($PortabilityShare.ResourceId)" } else { '' })
+    if ($shareName -eq 'portability') {
+      $steps.Add([pscustomobject]@{ Kind = 'PortabilityShare'; Name = $shareName; Parent = $acctName; ResourceGroup = $rgName; ResourceId = $resId })
+    }
   }
   if ($TierGroupExists) {
     $steps.Add([pscustomobject]@{ Kind = 'ResourceGroup'; Name = $Names.TierGroup; Parent = ''; ResourceGroup = $Names.TierGroup; ResourceId = '' })
@@ -517,9 +551,19 @@ function Get-LwLastCopyCheck {
     [AllowEmptyCollection()] [object[]] $Steps = @(),
     [switch] $DiscardLastCopy
   )
-  $group = @($Steps | Where-Object { $_ -and $_.Kind -eq 'ResourceGroup' })
-  if ($group.Count -eq 0) { return }
-  $what = "$($group[0].Name) holds the only copy of the live ProfileUnity configuration, the FlexApp packages and the console (and its backup outside dev)"
+  $protected = @($Steps | Where-Object { $_ -and $_.Kind -in 'ResourceGroup', 'PortabilityShare' })
+  if ($protected.Count -eq 0) { return }
+  $rgStep = @($Steps | Where-Object { $_ -and $_.Kind -eq 'ResourceGroup' }) | Select-Object -First 1
+  $portStep = @($Steps | Where-Object { $_ -and $_.Kind -eq 'PortabilityShare' }) | Select-Object -First 1
+  $what = $(if ($rgStep -and $portStep) {
+      "$($rgStep.Name) holds the only copy of the live ProfileUnity configuration, the FlexApp packages and the console (and its backup outside dev), and share $($portStep.Name) holds user portability archives"
+    }
+    elseif ($rgStep) {
+      "$($rgStep.Name) holds the only copy of the live ProfileUnity configuration, the FlexApp packages and the console (and its backup outside dev)"
+    }
+    else {
+      "Share $($portStep.Name) on $($portStep.Parent) holds the only copy of user portability archives"
+    })
   if ($DiscardLastCopy) { return Get-LwCheckResult WARN 'last-copy' "$what. Removing it anyway: -DiscardLastCopy was given." -Category Cleanup }
   Get-LwCheckResult FAIL 'last-copy' "$what. Nothing was removed." -Recommendation 'Copy what you need to keep somewhere outside this resource group and check the copy, then run Cleanup again with -DiscardLastCopy.' -Category Cleanup
 }
@@ -531,9 +575,16 @@ function Get-LwTeardownCheck {
     [Parameter(Mandatory)] $Names,
     [bool] $TierGroupExists = $false,
     [AllowEmptyCollection()] [object[]] $Peering = @(),
-    [AllowEmptyCollection()] [object[]] $DnsLink = @()
+    [AllowEmptyCollection()] [object[]] $DnsLink = @(),
+    [AllowEmptyCollection()] [object[]] $HostRunCommand = @(),
+    [AllowEmptyCollection()] [object[]] $DcrAssociation = @(),
+    [AllowEmptyCollection()] [object[]] $HostRoleAssignment = @(),
+    $PortabilityShare = $null,
+    [switch] $RemoveUserData
   )
-  $left = @(Get-LwCleanupPlan -Names $Names -TierGroupExists $TierGroupExists -Peering $Peering -DnsLink $DnsLink)
+  $left = @(Get-LwCleanupPlan -Names $Names -TierGroupExists $TierGroupExists -Peering $Peering -DnsLink $DnsLink `
+      -HostRunCommand $HostRunCommand -DcrAssociation $DcrAssociation -HostRoleAssignment $HostRoleAssignment `
+      -PortabilityShare $PortabilityShare -RemoveUserData:$RemoveUserData)
   foreach ($s in $left) {
     Get-LwCheckResult FAIL 'teardown' "Still there: $($s.Kind) $($s.Name)$(if ($s.Parent) { " on $($s.Parent)" })" -Recommendation 'Run Cleanup again; if it stays, remove it in the portal and record why.' -Category Cleanup
   }
@@ -746,37 +797,102 @@ function Get-LwCostEstimate {
   [CmdletBinding()]
   param(
     [AllowEmptyCollection()] [object[]] $Meter = @(),
+    [string] $Location = 'centralus',
+    [switch] $QueryRetailApi,
     [string[]] $Component = @('ProfileUnity'),
     [switch] $Portability,
     [switch] $Packaging,
     [switch] $Backup
   )
+  $rawMeters = [System.Collections.Generic.List[object]]::new()
+  foreach ($m in @($Meter | Where-Object { $_ })) {
+    if ($m.PSObject.Properties['Items'] -and $m.Items) {
+      foreach ($it in @($m.Items | Where-Object { $_ })) { $rawMeters.Add($it) }
+    }
+    else {
+      $rawMeters.Add($m)
+    }
+  }
+  if ($QueryRetailApi -and $rawMeters.Count -eq 0) {
+    $uri = "https://prices.azure.com/api/retail/prices?`$filter=armRegionName eq '$Location' and priceType eq 'Consumption'"
+    try {
+      $resp = Invoke-RestMethod -Uri $uri -Method Get -ErrorAction Stop
+      if ($resp -and $resp.PSObject.Properties['Items'] -and $resp.Items) {
+        foreach ($it in @($resp.Items | Where-Object { $_ })) { $rawMeters.Add($it) }
+      }
+    }
+    catch {
+      Write-Verbose "Retail price lookup failed for ${Location}: $($_.Exception.Message)"
+    }
+  }
+
+  $normalized = foreach ($m in $rawMeters) {
+    if ($m.PSObject.Properties['Sku'] -and $m.Sku) {
+      [pscustomobject]@{
+        Sku           = "$($m.Sku)"
+        UnitPrice     = [double]$m.UnitPrice
+        CurrencyCode  = "$($m.CurrencyCode)"
+        UnitOfMeasure = "$($m.UnitOfMeasure)"
+      }
+      continue
+    }
+    $armSku = $(if ($m.PSObject.Properties['armSkuName']) { "$($m.armSkuName)" } else { '' })
+    $skuName = $(if ($m.PSObject.Properties['skuName']) { "$($m.skuName)" } else { '' })
+    $svcName = $(if ($m.PSObject.Properties['serviceName']) { "$($m.serviceName)" } else { '' })
+    $meterName = $(if ($m.PSObject.Properties['meterName']) { "$($m.meterName)" } else { '' })
+    $mappedSku = switch ($true) {
+      ($armSku -eq 'Standard_D2as_v5' -or $skuName -eq 'Standard_D2as_v5') { 'Standard_D2as_v5'; break }
+      ($skuName -eq 'P10 LRS' -or $armSku -eq 'Premium_SSD_Managed_Disks_P10' -or $meterName -eq 'P10 LRS Disk') { 'P10 LRS'; break }
+      ($skuName -eq 'Standard NAT Gateway' -or ($svcName -eq 'Azure NAT Gateway' -and $meterName -eq 'Standard Gateway')) { 'Standard NAT Gateway'; break }
+      ($skuName -eq 'Private Endpoint' -or ($svcName -eq 'Azure Private Link' -and $meterName -eq 'Standard Private Endpoint')) { 'Private Endpoint'; break }
+      ($armSku -eq 'Standard_LRS' -or $skuName -in 'Standard_LRS', 'Standard LRS') { 'Standard_LRS'; break }
+      ($armSku -eq 'Premium_LRS' -or $skuName -in 'Premium_LRS', 'Premium LRS') { 'Premium_LRS'; break }
+      ($skuName -eq 'Azure Backup' -or $svcName -eq 'Backup') { 'Azure Backup'; break }
+      ($armSku -eq 'Standard_D4s_v5' -or $skuName -eq 'Standard_D4s_v5') { 'Standard_D4s_v5'; break }
+      default { $(if ($armSku) { $armSku } else { $skuName }) }
+    }
+    if ($mappedSku) {
+      [pscustomobject]@{
+        Sku           = $mappedSku
+        UnitPrice     = [double]$m.unitPrice
+        CurrencyCode  = "$($m.currencyCode)"
+        UnitOfMeasure = "$($m.unitOfMeasure)"
+      }
+    }
+  }
+
   $items = [System.Collections.Generic.List[object]]::new()
   if (@($Component | Where-Object { $_ -in 'ProfileUnity', 'FlexApp' }).Count -gt 0) {
-    $items.Add(@{ Name = 'Console VM (Standard_D2as_v5)'; Sku = 'Standard_D2as_v5' })
-    $items.Add(@{ Name = 'NAT Gateway'; Sku = 'Standard NAT Gateway' })
-    $items.Add(@{ Name = 'Private endpoints (3x)'; Sku = 'Private Endpoint' })
-    $items.Add(@{ Name = 'Tier storage (config, packages, media)'; Sku = 'Standard_LRS' })
+    $items.Add(@{ Name = 'Console VM (Standard_D2as_v5)'; Sku = 'Standard_D2as_v5'; Quantity = 1 })
+    $items.Add(@{ Name = 'Console OS disk (Premium SSD P10)'; Sku = 'P10 LRS'; Quantity = 1 })
+    $items.Add(@{ Name = 'NAT Gateway'; Sku = 'Standard NAT Gateway'; Quantity = 1 })
+    $items.Add(@{ Name = 'Private endpoints (3x)'; Sku = 'Private Endpoint'; Quantity = 3 })
+    $items.Add(@{ Name = 'Tier storage (config, packages, media)'; Sku = 'Standard_LRS'; Quantity = 1 })
   }
-  if ($Portability) { $items.Add(@{ Name = 'Portability share (100 GiB Premium Files)'; Sku = 'Premium_LRS' }) }
-  if ($Packaging) { $items.Add(@{ Name = 'Packaging VM (Standard_D2as_v5)'; Sku = 'Standard_D2as_v5' }) }
-  if ($Backup) { $items.Add(@{ Name = 'Recovery Services backup vault'; Sku = 'Azure Backup' }) }
-  if ($Component -contains 'Stratusphere') { $items.Add(@{ Name = 'Stratusphere Hub (Standard_D4s_v5 + Marketplace plan)'; Sku = 'Standard_D4s_v5' }) }
+  if ($Portability) { $items.Add(@{ Name = 'Portability share (100 GiB Premium Files)'; Sku = 'Premium_LRS'; Quantity = 100 }) }
+  if ($Packaging) { $items.Add(@{ Name = 'Packaging VM (Standard_D2as_v5)'; Sku = 'Standard_D2as_v5'; Quantity = 1 }) }
+  if ($Backup) { $items.Add(@{ Name = 'Recovery Services backup vault'; Sku = 'Azure Backup'; Quantity = 1 }) }
+  if ($Component -contains 'Stratusphere') { $items.Add(@{ Name = 'Stratusphere Hub (Standard_D4s_v5 + Marketplace plan)'; Sku = 'Standard_D4s_v5'; Quantity = 1 }) }
 
   $lines = foreach ($item in $items) {
-    $hit = @($Meter | Where-Object { $_ -and $_.Sku -eq $item.Sku })
+    $hit = @($normalized | Where-Object { $_ -and $_.Sku -eq $item.Sku })
     $priceText = $(if ($hit.Count -eq 1) { "$($hit[0].UnitPrice) $($hit[0].CurrencyCode) per $($hit[0].UnitOfMeasure)" } elseif ($hit.Count -gt 1) { "multiple meters ($($hit.Count)) matched $($item.Sku)" } else { 'unpriced (offline; query prices.azure.com before a live run)' })
     [pscustomobject]@{
-      Line   = $item.Name
-      Sku    = $item.Sku
-      Priced = ($hit.Count -eq 1)
-      Detail = "$($item.Name): $priceText"
+      Line          = $item.Name
+      Sku           = $item.Sku
+      Quantity      = $item.Quantity
+      UnitPrice     = $(if ($hit.Count -eq 1) { [double]$hit[0].UnitPrice } else { $null })
+      CurrencyCode  = $(if ($hit.Count -eq 1) { $hit[0].CurrencyCode } else { '' })
+      UnitOfMeasure = $(if ($hit.Count -eq 1) { $hit[0].UnitOfMeasure } else { '' })
+      Priced        = ($hit.Count -eq 1)
+      Detail        = "$($item.Name): $priceText"
     }
   }
   $warning = Get-LwCheckResult WARN 'budget' "The landing zone's budget Lock doesn't stop this tier: the console, NAT Gateway, private endpoints and storage keep billing." -Recommendation 'In dev, run Cleanup the same day (D-H6).' -Category Cost
   [pscustomobject]@{
-    Lines   = @($lines)
-    Warning = $warning
+    Location = $Location
+    Lines    = @($lines)
+    Warning  = $warning
   }
 }
 
@@ -850,6 +966,7 @@ function Get-LwPlanSummary {
   }
   foreach ($c in $Component) {
     if (@($built[$c]) -contains $Action) { continue }
+    if ($c -eq 'FlexApp' -and $Action -eq 'Configure' -and $Component -contains 'ProfileUnity') { continue }
     Get-LwCheckResult FAIL "$($c.ToLower())-$($Action.ToLower())" "$Action for $c is not applicable or not built (deploy-spec section 11)." -Category $c
   }
   if ($Action -in 'Plan', 'Deploy' -and @($Component | Where-Object { $_ -in 'ProfileUnity', 'FlexApp' }).Count -gt 0) {

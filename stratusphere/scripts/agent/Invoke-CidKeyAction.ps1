@@ -32,7 +32,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$settingsKeys = @('HKLM:\SOFTWARE\Liquidware Labs\Connector ID', 'HKLM:\SOFTWARE\WOW6432Node\Liquidware Labs\Connector ID')
+$settingsKeys = @(
+  'HKLM:\SOFTWARE\Liquidware Labs\Connector ID',
+  'HKLM:\SOFTWARE\WOW6432Node\Liquidware Labs\Connector ID',
+  'HKLM:\SOFTWARE\WOW6432Node\Liquidware Labs\ConnectorID'
+)
 $tempInstaller = Join-Path $env:TEMP 'ssux-cidkey-installer.exe'
 
 function Write-Result([string] $Status, [string] $Version, [string] $Detail) {
@@ -41,7 +45,7 @@ function Write-Result([string] $Status, [string] $Version, [string] $Detail) {
 }
 
 function Get-CidKeyState {
-  # Settings key (6.7+), uninstall entry (version, uninstaller) and services, judged together.
+  # Settings key (6.7+ and pre-6.7), uninstall entry (version, uninstaller) and services, judged together.
   $settings = @($settingsKeys | Where-Object { Test-Path $_ })
   $entry = $null
   foreach ($root in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall') {
@@ -147,7 +151,9 @@ function Remove-CidKeyLeftover {
     if (Test-Path $k) { Remove-Item $k -Recurse -Force; $removed += 'settings key' }
   }
   foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }) {
-    $folders += @(Get-ChildItem (Join-Path $base 'Liquidware Labs') -Directory -Filter 'Connector ID*' -ErrorAction SilentlyContinue | ForEach-Object FullName)
+    foreach ($vendorDir in 'Liquidware', 'Liquidware Labs') {
+      $folders += @(Get-ChildItem (Join-Path $base $vendorDir) -Directory -Filter 'Connector ID*' -ErrorAction SilentlyContinue | ForEach-Object FullName)
+    }
   }
   foreach ($f in ($folders | Sort-Object -Unique)) {
     if ($f -like '*Liquidware*' -and (Test-Path $f)) { Remove-Item $f -Recurse -Force -ErrorAction SilentlyContinue; $removed += "folder $f" }

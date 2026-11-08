@@ -68,12 +68,12 @@ To assess desktops on another VNet (for example an avd-landing-zone spoke), add 
 ### First-time Hub setup (manual for now)
 
 1. Open the appliance console through Bastion (portal: VM > Connect > Bastion), or browse to `https://10.60.0.4` from a machine on a connected network.
-2. The password Azure set is in Key Vault: `Get-AzKeyVaultSecret -VaultName <kv> -Name appliance-admin-password -AsPlainText`.
+2. The password Azure set is the appliance's SSH login (`Get-AzKeyVaultSecret -VaultName <kv> -Name appliance-admin-password -AsPlainText`). The web console signs in as `ssadmin` with Liquidware's documented default, which should be changed at first sign-in.
 3. Apply your Stratusphere license.
-4. Create a dedicated API user. The default `ssadmin` account can't use the API.
-5. Under **Hub Administration > Configuration > Security Settings**, add the addresses that will call the API to the whitelist.
+4. Create a dedicated API user and enable **Allow API Access** (Inventory > Users). API access is configured per user; using a dedicated read-only account rather than `ssadmin` is recommended.
+5. Under **Hub Administration > Configuration > Security Settings**, add the addresses that will call the API to the **Whitelist**, and leave **API Client IPs** empty (any address listed in API Client IPs can read the API with no credentials).
 
-If you find the appliance doesn't use the credential Azure sets, or first boot asks for something not listed here, please open an issue: the first real runs decide how far this stage can be automated.
+If first boot asks for something not listed here, please open an issue: the first real runs decide how far this stage can be automated.
 
 ### Roll out the Connector ID Key
 

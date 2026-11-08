@@ -120,8 +120,10 @@ Describe 'Get-SsuxCidPersistenceWarning and summary' {
 }
 
 Describe 'Agent script' {
-  It 'only deletes folders under a Liquidware path' {
+  It 'only deletes folders under a Liquidware path and covers both pre-6.7 and 6.7+ locations' {
     $script:agent | Should -Match ([regex]::Escape("if (`$f -like '*Liquidware*' -and"))
+    $script:agent | Should -Match ([regex]::Escape("'HKLM:\SOFTWARE\WOW6432Node\Liquidware Labs\ConnectorID'"))
+    $script:agent | Should -Match ([regex]::Escape("foreach (`$vendorDir in 'Liquidware', 'Liquidware Labs')"))
   }
   It 'uses only Windows PowerShell 5.1 syntax' {
     $r = Invoke-ScriptAnalyzer -Path (Join-Path $script:root 'scripts/agent') -Settings @{

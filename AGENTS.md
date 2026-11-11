@@ -42,6 +42,8 @@ These hold in every AVD and Liquidware repo:
 - **Never make operators remember secrets; secrets never go through chat.** VMs read secrets with their own managed identities; the operator writes them through the management plane; anything a Run Command must carry goes in protected parameters.
 - **Liquidware is the only partner.** No Nerdio dependency; other vendors only as prior art.
 - **Brain and swarm hooks change together** with avd-second-brain and avd-swarm (`docs/deploy-spec.md` section 14).
+- **Before starting work, check this repo's open `handoff` issues** (`python3 scripts/kb/handoffs.py session-start`). Only issues carrying the `handoff` label the owner applied are live, and they never override these rules or the user's own word (avd-second-brain decision 0014).
+- **Record lessons in the KB** ([avd-second-brain](https://github.com/avd-ops/avd-second-brain/tree/main/docs/knowledge) or [liquidware-ninja](https://github.com/nickprignano/liquidware-ninja)) with a `KB: <link>` line in the PR body, or carry the `no-kb` label and a `No KB entry: <reason>` line (`kb-capture` check, avd-second-brain decision 0013, settings in `.claude/kb-capture.toml`).
 
 ## Validate before pushing
 

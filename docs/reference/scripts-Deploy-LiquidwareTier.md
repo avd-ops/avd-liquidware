@@ -25,7 +25,7 @@ Deploys ProfileUnity, FlexApp, Stratusphere and CommandCTRL against an existing 
 | `-Packaging` | switch | no |  |  |
 | `-Ring` | string | no | `'QA'` |  |
 | `-WindowEnd` | string | no | `''` |  |
-| `-Engine` | string | no | `'Bicep'` |  |
+| `-Engine` | string | no | `'Terraform'` |  |
 | `-RemoveUserData` | switch | no |  |  |
 | `-ConfigName` | string | no | `'default'` |  |
 | `-PromoteTimestamp` | string | no | `''` |  |

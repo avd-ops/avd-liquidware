@@ -17,7 +17,7 @@
                then teardown evidence. Asks first; -Force skips; -WhatIf lists.
 
   Plan and Check are read-only. Every action writes a JSON report to output/ (git-ignored).
-  What-if needs the Bicep CLI (Cloud Shell has it).
+  Plan uses Terraform by default (or the Bicep CLI with -Engine Bicep; Cloud Shell has it).
 
 .EXAMPLE
   ./scripts/Deploy-LiquidwareTier.ps1 -NamePrefix avdlz -Environment dev -Component ProfileUnity,FlexApp,Stratusphere
@@ -51,7 +51,7 @@ param(
   [switch] $Packaging,
   [ValidateSet('QA', 'All')] [string] $Ring = 'QA',
   [string] $WindowEnd = '',
-  [ValidateSet('Bicep', 'Terraform')] [string] $Engine = 'Bicep',
+  [ValidateSet('Terraform', 'Bicep')] [string] $Engine = 'Terraform',
   [switch] $RemoveUserData,
   [string] $ConfigName = 'default',
   [string] $PromoteTimestamp = '',

@@ -214,7 +214,7 @@ function Get-LwStratusphereArgument {
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)] $LandingZone,
-    [ValidateSet('Bicep', 'Terraform')] [string] $Engine = 'Bicep',
+    [ValidateSet('Terraform', 'Bicep')] [string] $Engine = 'Terraform',
     [switch] $Bastion
   )
   $lz = $LandingZone

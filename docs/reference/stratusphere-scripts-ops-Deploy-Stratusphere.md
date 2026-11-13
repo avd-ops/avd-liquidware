@@ -32,7 +32,7 @@ One entry point for every role. -Role picks the appliances; -Action what to do w
 | `-Force` | switch | no |  | Cleanup without asking. |
 | `-DiscardLastCopy` | switch | no |  | Cleanup of the Hub or Database: remove them although they hold the only copy of the assessment data (decision 0016 in avd-second-brain). -Force never implies it. |
 | `-OutputPath` | string | no | `''` |  |
-| `-Engine` | string | no | `'Bicep'` |  |
+| `-Engine` | string | no | `'Terraform'` |  |
 
 ## Examples
 

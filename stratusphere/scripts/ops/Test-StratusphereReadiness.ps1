@@ -7,7 +7,7 @@
 .DESCRIPTION
   Read-only unless -Fix. Reports PASS, WARN, FAIL, INFO or SKIP per check, by category:
 
-    Tooling       PowerShell, Az modules, Bicep CLI (Deploy-Stratusphere.ps1 needs it)
+    Tooling       PowerShell, Az modules, Terraform CLI (default) or Bicep CLI (-Engine Bicep)
     Identity      subscription state; Owner, or Contributor plus User Access Administrator
                   (the deployment grants you read access to the Key Vault)
     Providers     Compute, Network, KeyVault, MarketplaceOrdering
@@ -33,7 +33,7 @@
   it is git-ignored.
 
   -Fix registers providers, accepts the Marketplace terms for the plans given and installs
-  the Bicep CLI. Nothing else is changed.
+  the Bicep CLI (when -Engine Bicep). Nothing else is changed.
 
   Every parameter can come from -ConfigPath (a JSON file; keys starting with _ are comments).
   Explicit parameters win. Exit code 0: no FAIL. 1: a FAIL. 2: could not run.
@@ -72,7 +72,7 @@ param(
   [string] $ConfigPath = '',
   [string] $OutputPath = '',
   [switch] $Fix,
-  [ValidateSet('Bicep', 'Terraform')] [string] $Engine = 'Bicep'
+  [ValidateSet('Terraform', 'Bicep')] [string] $Engine = 'Terraform'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -141,19 +141,29 @@ foreach ($m in $azModules) {
   }
   Import-Module $m
 }
-if (-not (Get-Command bicep -ErrorAction SilentlyContinue) -and (Test-Path (Join-Path $HOME '.azure/bin/bicep'))) {
-  $env:PATH = (Join-Path $HOME '.azure/bin') + [IO.Path]::PathSeparator + $env:PATH
-}
-if (Get-Command bicep -ErrorAction SilentlyContinue) {
-  Add-Result (Get-SsuxCheckResult PASS 'bicep' 'Bicep CLI on PATH')
-}
-elseif ($Fix -and (Get-Command az -ErrorAction SilentlyContinue) -and $PSCmdlet.ShouldProcess('bicep', 'az bicep install')) {
-  az bicep install | Out-Null
-  $env:PATH = (Join-Path $HOME '.azure/bin') + [IO.Path]::PathSeparator + $env:PATH
-  Add-Result (Get-SsuxCheckResult FIXED 'bicep' 'Installed Bicep CLI via az bicep install')
+if ($Engine -eq 'Terraform') {
+  if (Get-Command terraform -ErrorAction SilentlyContinue) {
+    Add-Result (Get-SsuxCheckResult PASS 'terraform' 'Terraform CLI on PATH')
+  }
+  else {
+    Add-Result (Get-SsuxCheckResult FAIL 'terraform' 'Terraform CLI not on PATH' -Recommendation 'Install Terraform (>= 1.9) or use -Engine Bicep.')
+  }
 }
 else {
-  Add-Result (Get-SsuxCheckResult WARN 'bicep' 'Bicep CLI not on PATH (Deploy-Stratusphere.ps1 installs it automatically)' -Recommendation 'Run with -Fix, or: az bicep install')
+  if (-not (Get-Command bicep -ErrorAction SilentlyContinue) -and (Test-Path (Join-Path $HOME '.azure/bin/bicep'))) {
+    $env:PATH = (Join-Path $HOME '.azure/bin') + [IO.Path]::PathSeparator + $env:PATH
+  }
+  if (Get-Command bicep -ErrorAction SilentlyContinue) {
+    Add-Result (Get-SsuxCheckResult PASS 'bicep' 'Bicep CLI on PATH')
+  }
+  elseif ($Fix -and (Get-Command az -ErrorAction SilentlyContinue) -and $PSCmdlet.ShouldProcess('bicep', 'az bicep install')) {
+    az bicep install | Out-Null
+    $env:PATH = (Join-Path $HOME '.azure/bin') + [IO.Path]::PathSeparator + $env:PATH
+    Add-Result (Get-SsuxCheckResult FIXED 'bicep' 'Installed Bicep CLI via az bicep install')
+  }
+  else {
+    Add-Result (Get-SsuxCheckResult WARN 'bicep' 'Bicep CLI not on PATH (Deploy-Stratusphere.ps1 installs it automatically)' -Recommendation 'Run with -Fix, or: az bicep install')
+  }
 }
 
 # ---------- Identity ----------

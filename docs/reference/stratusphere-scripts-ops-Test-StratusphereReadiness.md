@@ -34,7 +34,7 @@ Read-only unless -Fix. Reports PASS, WARN, FAIL, INFO or SKIP per check, by cate
 | `-ConfigPath` | string | no | `''` |  |
 | `-OutputPath` | string | no | `''` |  |
 | `-Fix` | switch | no |  |  |
-| `-Engine` | string | no | `'Bicep'` |  |
+| `-Engine` | string | no | `'Terraform'` |  |
 
 ## Examples
 

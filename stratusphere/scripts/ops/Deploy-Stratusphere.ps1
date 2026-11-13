@@ -66,7 +66,7 @@ param(
   # data (decision 0016 in avd-second-brain). -Force never implies it.
   [switch] $DiscardLastCopy,
   [string] $OutputPath = '',
-  [ValidateSet('Bicep', 'Terraform')] [string] $Engine = 'Bicep'
+  [ValidateSet('Terraform', 'Bicep')] [string] $Engine = 'Terraform'
 )
 
 $ErrorActionPreference = 'Stop'

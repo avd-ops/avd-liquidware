@@ -168,10 +168,10 @@ Describe 'Get-LwStratusphereArgument' {
     $a.HostPoolName | Should -Be 'vdpool-avdlz-dev'
     $a.HostPoolResourceGroup | Should -Be 'rg-avdlz-dev-avd'
     $a.NoBastion | Should -BeTrue
-    $a.Engine | Should -Be 'Bicep'
-    $tf = Get-LwStratusphereArgument -LandingZone (Get-DevLandingZone) -Engine Terraform -Bastion
-    $tf.Engine | Should -Be 'Terraform'
-    $tf.NoBastion | Should -BeFalse
+    $a.Engine | Should -Be 'Terraform'
+    $bicep = Get-LwStratusphereArgument -LandingZone (Get-DevLandingZone) -Engine Bicep -Bastion
+    $bicep.Engine | Should -Be 'Bicep'
+    $bicep.NoBastion | Should -BeFalse
   }
   It 'only names parameters Test-StratusphereReadiness.ps1 accepts' {
     $params = (Get-Command (Join-Path $script:root 'stratusphere/scripts/ops/Test-StratusphereReadiness.ps1')).Parameters.Keys

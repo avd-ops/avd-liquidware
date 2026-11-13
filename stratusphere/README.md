@@ -1,6 +1,6 @@
 # Stratusphere UX in Azure
 
-Deploy **Liquidware Stratusphere UX** in Azure for an **Azure Virtual Desktop** readiness assessment: check the subscription first, deploy the Hub (and optionally a Database and Collectors) from Azure Marketplace with one Bicep template, and roll the Connector ID Key out to the desktops you're assessing. Turning what Stratusphere measures into an AVD design is out of scope here.
+Deploy **Liquidware Stratusphere UX** in Azure for an **Azure Virtual Desktop** readiness assessment: check the subscription first, deploy the Hub (and optionally a Database and Collectors) from Azure Marketplace with Terraform (default) or Bicep (`-Engine Bicep`), and roll the Connector ID Key out to the desktops you're assessing. Turning what Stratusphere measures into an AVD design is out of scope here.
 
 > [!WARNING]
 > **Personal project. Not for production. No warranty.**
@@ -16,7 +16,7 @@ Early. What works today and what is next:
 
 | Stage | What it does | State |
 |---|---|---|
-| 1. Preflight | Identity and RBAC, providers, each role's Marketplace plan and terms, VM sizes, vCPU and network quota, policy, locks, address overlap, and the callback path from the endpoints (NSG and routes); captures the current state in a report. Reads an [avd-current-state](https://github.com/avd-ops/avd-current-state) package. `-Fix` registers providers, accepts terms, installs Bicep ([docs](docs/preflight.md)) | Done, not yet run against a real subscription |
+| 1. Preflight | Identity and RBAC, providers, each role's Marketplace plan and terms, VM sizes, vCPU and network quota, policy, locks, address overlap, and the callback path from the endpoints (NSG and routes); captures the current state in a report. Reads an [avd-current-state](https://github.com/avd-ops/avd-current-state) package. `-Fix` registers providers, accepts terms, installs Bicep when `-Engine Bicep` ([docs](docs/preflight.md)) | Done, not yet run against a real subscription |
 | 2. Appliances | One script, by role (Hub, Database, Collector): plan, check, deploy, fix, clean up ([docs](docs/appliances.md)). Resource group, VNet (optionally peered to your endpoints), Key Vault, Bastion, appliances from Azure Marketplace with static IPs | Done, not yet run against a real subscription |
 | 3. Hub setup | License, API user, API whitelist | Manual for now (console checklist below) |
 | 4. Connector ID Key rollout | Azure Run Command to a host pool, resource group or tag: check, install, fix, uninstall, cleanup, retry from a report ([docs](docs/agent-rollout.md)). Golden image and Intune for hosts created later | Done, not yet run against real machines |
@@ -36,7 +36,7 @@ Early. What works today and what is next:
 | Database VM (optional) | `-Role Database`; Liquidware advises one above 1,000 Connector ID Keys. `Standard_D4s_v5`, 256 GB, `10.60.0.5` |
 | Collector VMs (optional) | `-Role Collector -CollectorCount 1-4`. `Standard_D2s_v5`, 64 GB, `10.60.0.10` onward |
 
-Everything is built from pinned [Azure Verified Modules](https://aka.ms/avm) in `bicep/` or native `hashicorp/azurerm` resources in `terraform/` (`-Engine Bicep` or `-Engine Terraform`).
+Everything is built from native `hashicorp/azurerm` resources in `terraform/` (`-Engine Terraform`, default) or pinned [Azure Verified Modules](https://aka.ms/avm) in `bicep/` (`-Engine Bicep`).
 
 ## Quick start
 
@@ -47,7 +47,7 @@ git clone https://github.com/nickprignano/avd-liquidware.git
 Set-Location avd-liquidware/stratusphere
 
 # 1. List the Stratusphere plans offered in your region, then run the full preflight.
-#    -Fix registers providers, accepts the Marketplace terms and installs the Bicep CLI.
+#    -Fix registers providers, accepts the Marketplace terms (and installs the Bicep CLI with -Engine Bicep).
 #    The host pool (or -EndpointSubnetId) lets it check the callback path from the endpoints.
 ./scripts/ops/Test-StratusphereReadiness.ps1 -Location eastus2
 ./scripts/ops/Test-StratusphereReadiness.ps1 -Location eastus2 -HubPlan <plan> -Fix `

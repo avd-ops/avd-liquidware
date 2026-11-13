@@ -218,7 +218,7 @@ Describe 'Deploy-LiquidwareTier.ps1 dispatch for Configure, Promote, Fix, Plan a
     Mock Get-AzSubscriptionDeploymentWhatIfResult {
       [pscustomobject]@{ Changes = @([pscustomobject]@{ ChangeType = 'Modify'; FullyQualifiedResourceId = '/subscriptions/0/resourceGroups/rg-avdlz-dev-liquidware/providers/Microsoft.Network/natGateways/nat-avdlz-dev-liquidware' }) }
     }
-    & $script:entry -NamePrefix avdlz -Environment dev -Component ProfileUnity -Action Fix -ReportDirectory $TestDrive -Force
+    & $script:entry -NamePrefix avdlz -Environment dev -Component ProfileUnity -Action Fix -Engine Bicep -ReportDirectory $TestDrive -Force
     $LASTEXITCODE | Should -Be 0
     Should -Invoke Start-AzVM -Times 1 -Exactly -ParameterFilter { $Name -eq 'vm-avdlzlwcon' }
     Should -Invoke Sync-LiquidwareHosts.ps1 -Times 1 -Exactly -ParameterFilter { $Action -eq 'Check' }
@@ -244,7 +244,7 @@ Describe 'Deploy-LiquidwareTier.ps1 dispatch for Configure, Promote, Fix, Plan a
   }
 
   It 'surfaces Get-LwCostEstimate lines and the budget warning during -Action Plan' {
-    & $script:entry -NamePrefix avdlz -Environment dev -Component ProfileUnity -Action Plan -ReportDirectory $TestDrive
+    & $script:entry -NamePrefix avdlz -Environment dev -Component ProfileUnity -Action Plan -Engine Bicep -ReportDirectory $TestDrive
     $LASTEXITCODE | Should -Be 0
     Should -Invoke Write-Host -ParameterFilter { "$Object" -match 'INFO\s+cost-estimate' }
     Should -Invoke Write-Host -ParameterFilter { "$Object" -match 'WARN\s+budget' }
